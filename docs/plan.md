@@ -28,7 +28,8 @@ LLM completion plus one child process. That is the whole product.
 - No new API keys, no own model configuration — it reuses the session model and pi's auth
   (the codebase-memory lesson recorded in pi-weave: resolve the session model through
   `ctx.modelRegistry`, which owns auth).
-- No persistent state, no background resources, no UI surfaces beyond confirm/notify.
+- No background resources, no UI surfaces beyond confirm/notify. The only disk artifact is
+  the lightweight history cache (§4.6) — no config, no session data.
 - No Windows support in v1 (POSIX shell; `bash -lc`). Noted as a follow-up.
 
 ### Why a dedicated flag instead of just prompting pi?
@@ -134,8 +135,9 @@ pi --exec "…prompt…"
                             --exec-yes skips; --exec-print forces print-only
         6. execute           spawn("bash", ["-lc", cmd]) in ctx.cwd, stream stdout+stderr,
                             kill on ctx.signal / timeout (default 120s, flag-overridable)
-        7. report            streamed output, exit code; history not persisted (--no-session
-                            recommended in docs; extension never persists anything itself)
+        7. report            streamed output, exit code; pi session file not written by us
+                            (--no-session recommended in docs for one-shots)
+        7.5 record           append one JSONL entry to the history cache (§4.6) — every outcome
         8. shutdown          ctx.shutdown(); print mode: process.exitCode = command's code
 ```
 
@@ -149,7 +151,8 @@ src/core/            No @earendil-works/*, no typebox, no node built-ins beyond 
   contract.ts        system prompt + output contract builder
   parse.ts           model-output → command string (fences, quotes, multi-line, refusal)
   lint.ts            classify: ok | warn(reason) | deny(reason); exported rule tables
-  types.ts           ExecRequest, ParsedCommand, LintVerdict, RunPlan
+  types.ts           ExecRequest, ParsedCommand, LintVerdict, RunPlan, HistoryEntry
+  history.ts         append-only JSONL cache: append/read/preview (failure-tolerant)
   index.ts           orchestrator: (req, deps) → RunPlan  [pure; deps-injected]
 
 src/pi/
@@ -175,6 +178,7 @@ network or spawn a real shell.
 | `--exec-yes` | boolean | skip confirmation (still refuses hard-denied commands) |
 | `--exec-print` | boolean | never execute; print the proposed command only (dry run) |
 | `--exec-timeout <sec>` | number | execution timeout, default 120 |
+| `--exec-history <n>` | string | print the last N cache entries (newest first) and exit; `/exec-history [n]` is the in-session form |
 
 Confirmation matrix:
 
@@ -200,8 +204,9 @@ Headless default is dry-run because there is no one to ask — safety by constru
    - **ok**: everything else.
 3. **Confirm-by-default**, dry-run headless default, `--exec-yes` cannot bypass deny.
 4. **Abort-aware**: model call and child process both honor `ctx.signal` (Esc/Ctrl+C).
-5. **No persistence**: the extension never writes anything; docs recommend
-   `--no-session` for one-shots (session file is pi's, not ours, to suppress).
+5. **Minimal persistence**: the only disk artifact is the history cache (§4.6) — append-only
+   JSONL, failure-tolerant, never captures child output. Docs still recommend `--no-session`
+   for one-shots (pi's session file is pi's, not ours, to suppress).
 
 ### 4.5 Key decisions
 
@@ -219,10 +224,29 @@ Headless default is dry-run because there is no one to ask — safety by constru
   wrapper script — all identical. Single-dash `-exec` verified invalid (see §2); docs show
   `--exec` only.
 - **D6 — no config files in v1.** Flags only. A settings-driven lint/config can come later;
-  v1 ships zero configuration surface.
+  v1 ships zero configuration surface. (The history cache is data, not configuration.)
 - **D7 — no skill in v1.** pi-weave ships skills; this extension's whole surface is one
   flag + one command, so a skill would be redundant. Revisit if interactive refactoring
   ("make that `tar` command safer") is wanted.
+
+### 4.6 History cache (lightweight, always-on)
+
+Owner decision: pull P6's "history file" candidate into v1, as a super-lightweight cache.
+Every exec outcome — input (the request) and output (the proposed command, lint verdict,
+exit code) — is appended locally, referable later and previewable. This section replaces the
+old blanket "no persistence" rule for this one artifact; nothing else is ever written.
+
+- **File**: `~/.pi/agent/cache/pi-exec/history.jsonl` — append-only, one JSON object per line:
+  `{ ts, text, command, kind, warn?, exitCode?, cwd }` with `kind ∈ run | dry-run |
+  declined | refuse | error`. Child process output is deliberately NOT captured (it streams
+  live; capturing would force unbounded buffering — that is the "super lightweight" call).
+  No rotation in v1; deleting the file resets the history.
+- **Failure-tolerant**: read/write errors are swallowed (empty list / skipped append) — the
+  cache may never break an exec.
+- **Refer**: the last 3 recorded commands are injected into the generation prompt as
+  reference context, so "run that ffmpeg command again" resolves against real history.
+- **Preview**: `/exec-history [n]` in-session (default 10) and one-shot
+  `pi --exec-history <n>` (newest first, then exit).
 
 ---
 
@@ -239,6 +263,7 @@ Headless default is dry-run because there is no one to ask — safety by constru
 | FR5 | `/exec <text>` works inside a running session without ending it |
 | FR6 | Absent flag ⇒ extension is inert (no events handled beyond registration, no status, no writes) |
 | FR7 | No-model, empty-parse, and lint-deny paths all produce a clear message and correct exit code |
+| FR8 | Every outcome is appended to the history cache; `/exec-history [n]` and `--exec-history <n>` preview it; the last 3 commands feed the model as reference context |
 
 ### Safety
 
@@ -247,7 +272,7 @@ Headless default is dry-run because there is no one to ask — safety by constru
 | SR1 | Hard-deny list is enforced even with `--exec-yes` |
 | SR2 | Warn-class commands show the reason in the confirm dialog |
 | SR3 | Model output is never executed unparseable/unlinted; fences and chatter are stripped or refused |
-| SR4 | Nothing is persisted to disk by the extension |
+| SR4 | The only disk write is the history cache (§4.6); no child output, no session data, no config |
 
 ### Non-functional
 
@@ -296,6 +321,12 @@ pi --exec "re-encode all flac to mp3" --exec-timeout 900
 
 # inside a running pi session
 /exec show me the 10 largest directories under ~
+
+# what did I run lately? (newest first, then exit)
+pi --exec-history 10
+
+# same, inside a session
+/exec-history 5
 ```
 
 Docs promise: **the model proposes; lint gates; you decide.** `--exec-yes` is
@@ -586,12 +617,12 @@ feature and keeps the extension honest with pi's "no background resources" rule.
 | Phase | Deliverable | Acceptance |
 |---|---|---|
 | **P0 — scaffold** | repo files: package.json, tsconfig, vitest config, .gitignore, AGENTS.md, empty src/core+src/pi, workflows ci.yml+publish.yml, README (with pi credit, §12) + `scripts/pi-exec.sh` (the verified v0 wrapper, §2.5), CHANGELOG.md | `npm install && npm run check` green on empty suites; `scripts/pi-exec.sh "echo hi"` declines cleanly |
-| **P1 — core engine** | contract.ts, parse.ts, lint.ts, index.ts + full unit suites (fake complete only) | ≥95% coverage on core; NR3 import-scan test passes |
-| **P2 — pi adapter** | flags, session_start wiring, /exec command, run.ts with exec seam + adapter tests (fake exec) | `pi -e . --exec "echo hi" --exec-print` prints `echo hi` end-to-end |
+| **P1 — core engine** | contract.ts, parse.ts, lint.ts, history.ts, index.ts + full unit suites (fake complete only) | ≥95% coverage on core; NR3 import-scan test passes |
+| **P2 — pi adapter** | flags, session_start wiring, /exec + /exec-history commands, run.ts with exec seam + adapter tests (fake exec) | `pi -e . --exec "echo hi" --exec-print` prints `echo hi` end-to-end; the outcome lands in the history cache |
 | **P3 — execution + UX polish** | streaming output, timeout, abort wiring, exit-code passthrough, warn-reason display in confirm | manual smoke matrix (tui confirm / print dry-run / -yes / deny refusal) |
 | **P4 — docs** | README: usage (§6), the pi credit section (§12), wrapper + extension install paths; this plan stays as docs/plan.md; CHANGELOG.md | README renders; usage commands verified by hand |
 | **P5 — release infra** | push branch → PR → CI green → merge; pipeline publishes 0.1.1 with provenance + release notes | `pi -e npm:pi-exec --exec …` works from the published package |
-| **P6 — v1.1 candidates (post-release, not blockers)** | config-file lint overrides, `--exec-model` override, Windows/powershell path, history file of approved commands | discussed in README "Roadmap" |
+| **P6 — v1.1 candidates (post-release, not blockers)** | config-file lint overrides, `--exec-model` override, Windows/powershell path, richer history (search, rerun-by-id, child-output capture) — the basic cache itself ships in v1 (§4.6) | discussed in README "Roadmap" |
 
 ---
 
@@ -605,6 +636,8 @@ feature and keeps the extension honest with pi's "no background resources" rule.
 | `tests/pi/run.test.ts` | confirm accepted/rejected; exec streaming + timeout + abort; exit codes; notify guarded by hasUI | fake `complete`+`exec`+`ui` |
 | `tests/pi/index.test.ts` | flag absent → no-op; flag present → drives runExec; /exec arg parsing | fakes |
 | `tests/core/purity.test.ts` | scans src/core for `@earendil-works` imports (NR3) | fs scan |
+| `tests/core/history.test.ts` | append/read roundtrip, malformed-line skip, preview formatting, limit parsing | tmpdir fs |
+| `tests/pi/run.test.ts` (extends) | history entry appended per outcome via a `historyPath` seam | tmpdir fs |
 
 No test touches a network, spawns a real shell, or loads jiti — adapter tests exercise the
 same functions the factory wires, against fakes.

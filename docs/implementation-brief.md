@@ -51,6 +51,7 @@ Verified against `@earendil-works/pi-coding-agent` 0.85.1's actual `.d.ts` files
 | D-5 | One-shot `session_start` handler guards `event.reason === "startup"` | prevents accidental re-run on `/new`/`/resume`/`/reload` re-fires |
 | D-6 | Factory signature is `piExec(pi: ExtensionAPI, deps: RunDeps = {})` | test seam, mirrors pi-weave's `deps` pattern; jiti calls it with one arg in production |
 | D-7 | Warn-class commands emit a **security-risk banner to stdout** (user requirement): a shell-comment line `# ⚠ pi-exec: security risk — <reason>` printed to stdout before the command/output, in print-mode dry-run AND print-mode run. Comment format keeps `--exec-print \| sh` piping working (sh ignores comment lines) while making the risk impossible to miss. Clean (ok) commands keep stdout pure. json mode prints the banner to stderr (stdout is pi's JSON channel); TUI/RPC show the reason in the confirm dialog and notify. | user requirement: "on unsecure commands, pi-exec should flag it in stdout to user" |
+| D-8 | **History cache** (plan §4.6): append-only JSONL at `~/.pi/agent/cache/pi-exec/history.jsonl`, one entry per outcome; last-3 commands injected as model reference context; `/exec-history [n]` + `--exec-history <n>` preview. Replaces plan.md's original "no persistence" rule (§4.4.5/SR4 amended). | owner request: "keep input/output history somewhere in disk cache … super lightweight" |
 
 ## 3. Architecture (plan §4.2, unchanged)
 
@@ -60,6 +61,7 @@ src/core/            Portable engine. NO @earendil-works/*, NO typebox, NO ../pi
   contract.ts        EXEC_SYSTEM_PROMPT + buildUserPrompt
   parse.ts           parseModelOutput: raw model text → ParsedCommand
   lint.ts            lintCommand + DENY_RULES + WARN_RULES (table-driven)
+  history.ts         append-only JSONL cache: append/read/preview/parseHistoryLimit
   index.ts           planExec orchestrator + parseTimeoutSec + re-exports
 
 src/pi/
@@ -84,6 +86,19 @@ export interface ExecRequest {
   timeoutSec: number;
   hasUI: boolean;
   signal?: AbortSignal;          // exactOptionalPropertyTypes: never assign undefined explicitly
+  recentCommands?: readonly string[]; // last-3 history commands passed to the model as reference
+}
+
+export type HistoryEntryKind = "run" | "dry-run" | "declined" | "refuse" | "error";
+
+export interface HistoryEntry {
+  ts: number;               // Date.now() at record time
+  text: string;             // the user's request
+  command: string;          // proposed command, "" when none was produced
+  kind: HistoryEntryKind;
+  warn?: string;            // lint warn reason when present
+  exitCode?: number;        // set only when kind === "run"
+  cwd: string;
 }
 
 export type ParsedCommand =
@@ -121,8 +136,10 @@ export const EXEC_SYSTEM_PROMPT = [
   "Target shell: POSIX/bash. Working directory is the user's current directory.",
 ].join("\n");
 
-export function buildUserPrompt(request: string, cwd: string): string;
-// → `Request: ${request}\nWorking directory: ${cwd}`
+export function buildUserPrompt(request: string, cwd: string, recent?: readonly string[]): string;
+// → `Request: ${request}\nWorking directory: ${cwd}` and, when `recent` is non-empty, additionally:
+//   `\nRecent commands run via pi-exec (for reference):\n` + recent.map(c => "$ " + c).join("\n")
+//   (oldest → newest; commands only, no request texts)
 ```
 
 ### 4.3 `src/core/parse.ts`
@@ -243,6 +260,7 @@ export async function planExec(req: ExecRequest, deps: ExecDeps): Promise<ExecPl
    { maxTokens: MAX_OUTPUT_TOKENS, signal: req.signal })` — wrap in try/catch; throw →
    `{ kind: "error", reason: "generation failed: <err.message>", exitCode: 1 }`.
    Pass `signal` only when defined (exactOptionalPropertyTypes → conditional spread).
+   `buildUserPrompt` receives `req.recentCommands ?? []` as the third argument.
 3. `parseModelOutput(raw)` refusal → `{ kind: "refuse", reason, exitCode: 1 }`.
 4. `lintCommand(cmd)` deny → `{ kind: "refuse", reason: "safety lint denied: <reason>", exitCode: 1 }`.
 5. Warn reason captured when verdict is warn.
@@ -254,7 +272,31 @@ Build objects with conditional spreads for optional `warn`/`signal` — never as
 `undefined` explicitly (`exactOptionalPropertyTypes`).
 
 Re-export everything: `export * from "./types"` (type-only — use `export type * from` where
-verbatimModuleSyntax demands), plus the named runtime exports from contract/parse/lint.
+verbatimModuleSyntax demands), plus the named runtime exports from contract/parse/lint/history.
+
+### 4.6 `src/core/history.ts`
+
+```ts
+export async function appendHistoryEntry(path: string, entry: HistoryEntry): Promise<boolean>;
+export async function readHistory(path: string): Promise<HistoryEntry[]>;
+export function formatHistoryPreview(entries: readonly HistoryEntry[], limit?: number): string[];
+export function parseHistoryLimit(raw: string): number | null;
+```
+
+- `appendHistoryEntry`: `mkdir -p` the dirname, append `JSON.stringify(entry) + "\n"` —
+  NEVER throws; returns `false` on any fs error (the cache may never break an exec).
+- `readHistory`: read file, split lines, `JSON.parse` each, skip blank/malformed lines —
+  NEVER throws (ENOENT / unreadable / bad JSON → `[]`). Entries stay in file order
+  (chronological, oldest first).
+- `formatHistoryPreview(entries, limit = 10)`: NEWEST first, at most `limit` entries.
+  One line per entry: `<kind> · exit <n> · $ <command truncated to 120>` (exit part only when
+  present), and when `warn`/`text` exist a second indented line
+  `    ⚠ <warn> · request: <text truncated to 100>`. Empty input → `["no history yet"]`.
+  Tests must assert: newest-first order, command, kind, warn reason, exit code and request
+  text all visible somewhere in the lines.
+- `parseHistoryLimit(raw)`: `/^\d+$/` and > 0 → the number; anything else → `null`.
+- `HistoryEntry`/`HistoryEntryKind` live in `types.ts`; `index.ts` re-exports the history
+  module; `planExec` forwards `req.recentCommands` to `buildUserPrompt` (§4.2/§4.5).
 
 ## 5. Adapter specs
 
@@ -285,7 +327,7 @@ export function createSpawnExec(): ExecFn;
 
 ```ts
 export type CompleteFn = ExecDeps["complete"];
-export interface RunDeps { complete?: CompleteFn; exec?: ExecFn }
+export interface RunDeps { complete?: CompleteFn; exec?: ExecFn; historyPath?: string }
 export async function runExec(
   ctx: ExtensionContext | ExtensionCommandContext,
   req: ExecRequest,
@@ -294,7 +336,9 @@ export async function runExec(
 ```
 
 Constants: `WIDGET_KEY = "pi-exec"`, `WIDGET_TAIL_LINES = 15`, `NOTIFY_TAIL_LINES = 10`,
-`NOTIFY_LINE_CAP = 200`, `OUTPUT_BUFFER_CAP = 8000`.
+`NOTIFY_LINE_CAP = 200`, `OUTPUT_BUFFER_CAP = 8000`,
+`DEFAULT_HISTORY_PATH = join(homedir(), ".pi", "agent", "cache", "pi-exec", "history.jsonl")`
+(`node:os` homedir + `node:path` join; exported for the factory).
 
 Default seams: `deps.complete ??` wraps `ctx.modelRegistry.complete` (context with
 `{ role: "user", content, timestamp: Date.now() }`, options `{ maxTokens,
@@ -302,6 +346,10 @@ Default seams: `deps.complete ??` wraps `ctx.modelRegistry.complete` (context wi
 createSpawnExec()`.
 
 Flow:
+0. History wiring: `const historyPath = deps.historyPath ?? DEFAULT_HISTORY_PATH;`
+   `const recent = await readHistory(historyPath)` (never throws) → `recentCommands` =
+   last 3 entries with non-empty `command`, chronological → merged into the request passed
+   to `planExec` (conditional spread; omit the key when empty).
 1. `ctx.model` null → headless: `process.stderr.write("pi-exec: no active model — set one
    with /model or a provider env\n")`; with UI: `ctx.ui.notify(same, "error")`; return `1`.
 2. `plan = await planExec(req, { complete })`.
@@ -329,6 +377,12 @@ Flow:
    f. Report exit code: UI → notify(`pi-exec: finished (exit N)`) + rpc also gets output tail
       (`NOTIFY_TAIL_LINES` lines, each capped `NOTIFY_LINE_CAP` chars); print/json →
       `process.stderr.write("pi-exec: exit N\n")`. Return the child's exit code (124 if killed).
+6. **Record** — EVERY terminal outcome (no-model, refuse, error, dry-run, declined, run)
+   appends exactly one `HistoryEntry` to `historyPath`:
+   `{ ts: Date.now(), text: req.text, command: <command or "">, kind, ...(warn ? { warn } : {}),
+   ...(executed ? { exitCode } : {}), cwd: ctx.cwd }` with kind ∈
+   `run | dry-run | declined | refuse | error`. `appendHistoryEntry` never throws; its result
+   is ignored. Record even the no-model outcome (kind `error`, command `""`).
 
 Helper `notify(ctx, text, level)`: `ctx.hasUI ? ctx.ui.notify(text, level) :
 process.stderr.write("pi-exec: " + text + "\n")`.
@@ -349,8 +403,19 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
   - `exec-yes` — boolean, default false — "Skip the confirmation dialog (safety lint still applies)"
   - `exec-print` — boolean, default false — "Print the proposed command without running it"
   - `exec-timeout` — string — `Execution timeout in seconds (default ${DEFAULT_TIMEOUT_SEC})`
+  - `exec-history` — string — `Print the last N pi-exec history entries and exit` —
+    **NO `default`** (a default would fire the preview in every plain `pi` session;
+    absent → undefined → skipped)
 - `pi.on("session_start", async (event, ctx) => { ... })`:
   - `if (event.reason !== "startup") return;` (D-5)
+  - `const histRaw = pi.getFlag("exec-history")`; when it is a non-empty string →
+    history-preview one-shot (takes precedence over `--exec`; the exec pipeline is NOT
+    invoked): `const limit = parseHistoryLimit(histRaw)` — null → usage failure (message
+    mentions `--exec-history <n>`), exit code 1, shutdown. Else:
+    `const entries = await readHistory(DEFAULT_HISTORY_PATH)` →
+    `const lines = formatHistoryPreview(entries, limit)` → print mode: lines to **stdout**
+    (preview is data); json mode: lines to stderr; TUI/RPC: `ctx.ui.notify(lines.join("\n"),
+    "info")`. Then `process.exitCode = 0` in print/json, `await ctx.shutdown(); return;`.
   - `const text = pi.getFlag("exec")`; `undefined` → return (FR6 inert); `""`/whitespace →
     usage failure (`pi --exec "<request>"`), exit code 1, shutdown.
   - `parseTimeoutSec(pi.getFlag("exec-timeout"))` → null → failure, exit 1, shutdown.
@@ -363,6 +428,10 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
 - `pi.registerCommand("exec", { description, handler })`: empty args →
   `ctx.ui.notify("usage: /exec <request>", "warning")`; else same ExecRequest with defaults
   (`yes: false, printOnly: false, timeoutSec: DEFAULT_TIMEOUT_SEC`) + `runExec`; **no shutdown**.
+- `pi.registerCommand("exec-history", { description, handler })`: parse `args.trim()` —
+  empty → limit 10; invalid (`parseHistoryLimit` null) → `ctx.ui.notify("usage: /exec-history [n]",
+  "warning")`; valid → `ctx.ui.notify(formatHistoryPreview(await readHistory(
+  DEFAULT_HISTORY_PATH), limit).join("\n"), "info")`. No shutdown.
 - No `session_shutdown` handler (nothing is started — the absence is a feature).
 
 ## 6. Exit-code contract
@@ -373,6 +442,7 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
 | confirm declined / aborted | `130` |
 | dry-run (`--exec-print`, or headless without `--exec-yes`) | `0` |
 | executed | child's exit code (`124` when killed by timeout/abort) |
+| `--exec-history` / `/exec-history` preview | `0` — empty cache included (message, not error); invalid limit → `1` |
 
 ## 7. Tooling & thresholds
 
@@ -402,9 +472,14 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
 - `plan.test.ts` (fake `complete` only): ok→run; warn flows to plan; deny→refuse;
   NOT_ONE_COMMAND→refuse; empty model output→refuse; complete throws→error; empty
   request→error; printOnly→dry-run; headless+!yes→dry-run; headless+yes→run; tui+!yes→run;
-  signal forwarded to complete; maxTokens is 300.
+  signal forwarded to complete; maxTokens is 300; recentCommands (non-empty) appear in the
+  user prompt captured by the fake complete; empty recentCommands → no history section.
 - `purity.test.ts`: scan `src/core/**/*.ts` sources — forbid `@earendil-works`, `typebox`,
   and `from "../pi` / `from './pi` adapter imports (read files, regex import statements).
+- `history.test.ts` (tmpdir fs, no mocks): append/read roundtrip preserves order;
+  malformed lines skipped; ENOENT → []; unwritable dir → append returns false, no throw;
+  preview: newest-first, limit, substrings (command/kind/warn/exit/request), empty →
+  ["no history yet"]; `parseHistoryLimit` valid/invalid/zero/non-numeric.
 - `run.test.ts` (fake complete/exec/ui): every exit-code path; confirm called only when
   `!yes && hasUI`; confirm message contains command and warn reason; declined→130, no exec;
   dry-run→0, no exec, no confirm; headless default dry-run; headless yes→exec; exit passthrough
@@ -416,12 +491,20 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
   + warn → single warning notify containing both the risk text and the command**;
   tui widget updates + final notify; rpc tail notify; req.signal flows to exec opts.signal;
   timeout composition (exec receives a non-aborted signal); banner newline-safety (reason with
-  embedded newline collapses to spaces).
-- `index.test.ts` (fake pi harness + fake deps): registers 4 flags + command; flag absent →
+  embedded newline collapses to spaces); history via `deps.historyPath` (tmpdir file):
+  every outcome (run/dry-run/declined/refuse/error/no-model) appends exactly one entry with
+  the right kind and fields (exitCode only for run; warn only when lint warned); runExec
+  still returns the correct exit code when historyPath points somewhere unwritable;
+  recentCommands are loaded from the history file and reach the fake complete's user prompt.
+- `index.test.ts` (fake pi harness + fake deps): registers 5 flags + 2 commands; flag absent →
   inert (no shutdown, no exitCode); flag present → runExec runs end-to-end with fake deps →
   shutdown called + exitCode set (print mode); exitCode NOT set in tui mode; reason
   `reload`/`new` → inert; empty flag string → usage failure; invalid timeout → failure;
-  `/exec` empty args → usage notify; `/exec` valid → runs without shutdown.
+  `/exec` empty args → usage notify; `/exec` valid → runs without shutdown;
+  `--exec-history` set → preview printed (print mode: stdout), shutdown, exit 0, exec
+  pipeline NOT invoked; `--exec-history` invalid → usage failure exit 1; `/exec-history`
+  command → notify with preview lines (limit from arg, default 10); `/exec-history` invalid
+  arg → usage warning.
 - `exec.test.ts`: vi.mock child_process (see §5.1).
 
 ## 9. Acceptance for the whole implementation
