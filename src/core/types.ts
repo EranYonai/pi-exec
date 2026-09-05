@@ -15,6 +15,7 @@ export interface ExecRequest {
   hasUI: boolean;
   signal?: AbortSignal;
   recentCommands?: readonly string[]; // last-3 history commands passed to the model as reference
+  canPrompt?: boolean; // a controlling terminal exists: print mode may confirm on /dev/tty (D-9)
 }
 
 export type HistoryEntryKind = "run" | "dry-run" | "declined" | "refuse" | "error";

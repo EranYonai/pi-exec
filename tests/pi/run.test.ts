@@ -14,6 +14,23 @@ import type { ExecOptions, ExecResult } from "../../src/pi/exec";
 import { DEFAULT_HISTORY_PATH, formatSecurityBanner, runExec } from "../../src/pi/run";
 import type { RunDeps } from "../../src/pi/run";
 
+// The terminalConfirm fallback must never open a real /dev/tty: node:fs and
+// node:readline/promises are fully mocked (history uses node:fs/promises — a
+// different specifier, left untouched).
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    accessSync: vi.fn(),
+    createReadStream: vi.fn(),
+    createWriteStream: vi.fn(),
+  };
+});
+vi.mock("node:readline/promises", () => ({ createInterface: vi.fn() }));
+
+import { createReadStream, createWriteStream } from "node:fs";
+import { createInterface } from "node:readline/promises";
+
 let dir: string;
 
 beforeEach(async () => {
@@ -264,6 +281,26 @@ describe("runExec — headless print mode (exit codes & stdout discipline)", () 
     expect(deps.exec).not.toHaveBeenCalled();
   });
 
+  it("dry-run from the no-terminal rule prints the --exec-yes/--exec-print hint on stderr", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("ls -la");
+    await runExec(ctx, makeReq({ hasUI: false }), { ...deps, historyPath: historyPath() });
+    expect(stderr).toContain(
+      "pi-exec: dry run — not executed (no terminal to confirm; pass --exec-yes to run, --exec-print to print only)\n",
+    );
+  });
+
+  it("printOnly dry-run keeps the plain marker (deliberate, no hint)", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("ls -la");
+    await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+      ...deps,
+      historyPath: historyPath(),
+    });
+    expect(stderr).toContain("pi-exec: dry run — not executed\n");
+    expect(stderr.join("")).not.toContain("no terminal to confirm");
+  });
+
   it("headless --exec-yes runs: exit passthrough, command on stderr, output on stdout", async () => {
     const { ctx } = makeCtx({ mode: "print", hasUI: false });
     const deps = makeDeps("ls", async (_c, _cwd, opts) => {
@@ -379,6 +416,194 @@ describe("runExec — confirm flow (UI)", () => {
     expect(code).toBe(130);
     expect(deps.exec).not.toHaveBeenCalled();
     expect(ui.notify).toHaveBeenCalledWith("canceled — nothing executed", "info");
+  });
+});
+
+describe("runExec — D-9 terminal confirm (print mode, /dev/tty)", () => {
+  let stdout: string[];
+  let stderr: string[];
+  let stdoutSpy: ReturnType<typeof spyStdout>;
+  let stderrSpy: ReturnType<typeof spyStderr>;
+
+  beforeEach(() => {
+    stdout = [];
+    stderr = [];
+    stdoutSpy = spyStdout(stdout);
+    stderrSpy = spyStderr(stderr);
+  });
+
+  afterEach(() => {
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
+  });
+
+  const TTY_HINT =
+    "pi-exec: dry run — not executed (no terminal to confirm; pass --exec-yes to run, --exec-print to print only)";
+
+  function makeRl(answer: string, reject = false) {
+    return {
+      on: vi.fn(),
+      question: vi.fn((_q: string) => (reject ? Promise.reject(new Error("closed")) : Promise.resolve(answer))),
+      close: vi.fn(),
+    };
+  }
+
+  function mockRl(rl: ReturnType<typeof makeRl>): void {
+    vi.mocked(createInterface).mockReturnValue(rl as unknown as ReturnType<typeof createInterface>);
+  }
+
+  it("prompt seam asked exactly when !hasUI && canPrompt && !yes — true runs the command", async () => {
+    const { ctx, ui } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("ls -la");
+    const prompt = vi.fn(async () => true);
+    const code = await runExec(ctx, makeReq({ hasUI: false, canPrompt: true }), {
+      ...deps,
+      prompt,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(deps.exec).toHaveBeenCalledOnce();
+    expect(ui.confirm).not.toHaveBeenCalled();
+    // Review polish: the tty question already showed `$ ls -la` — the stderr
+    // run-report must not duplicate it.
+    expect(stderr.join("")).not.toContain("$ ls -la");
+  });
+
+  it("without a terminal prompt (yes path), the stderr run-report still prints", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("ls -la");
+    const code = await runExec(ctx, makeReq({ hasUI: false, yes: true }), {
+      ...deps,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    expect(stderr.join("")).toContain("$ ls -la\n");
+  });
+
+  it("the prompt receives the command and the warn reason", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("sudo apt update");
+    const prompt = vi.fn(async () => true);
+    await runExec(ctx, makeReq({ hasUI: false, canPrompt: true }), {
+      ...deps,
+      prompt,
+      historyPath: historyPath(),
+    });
+    expect(prompt).toHaveBeenCalledWith("sudo apt update", "runs as root");
+  });
+
+  it("prompt → false: no exec, declined history entry, exit 130, stderr cancel line", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("rm -rf ./build");
+    const prompt = vi.fn(async () => false);
+    const code = await runExec(ctx, makeReq({ hasUI: false, canPrompt: true }), {
+      ...deps,
+      prompt,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(130);
+    expect(deps.exec).not.toHaveBeenCalled();
+    expect(stderr).toContain("pi-exec: canceled — nothing executed\n");
+    const entries = await readHistory(historyPath());
+    expect(entries[0]).toMatchObject({ kind: "declined", command: "rm -rf ./build" });
+  });
+
+  it("yes skips the terminal prompt entirely", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("ls -la");
+    const prompt = vi.fn(async () => false);
+    const code = await runExec(ctx, makeReq({ hasUI: false, canPrompt: true, yes: true }), {
+      ...deps,
+      prompt,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    expect(prompt).not.toHaveBeenCalled();
+    expect(deps.exec).toHaveBeenCalledOnce();
+  });
+
+  it("hasUI keeps the dialog — the terminal prompt is never used", async () => {
+    const { ctx, ui } = makeCtx({ mode: "tui", hasUI: true });
+    const deps = makeDeps("ls -la");
+    const prompt = vi.fn(async () => true);
+    await runExec(ctx, makeReq({ hasUI: true, canPrompt: true }), {
+      ...deps,
+      prompt,
+      historyPath: historyPath(),
+    });
+    expect(ui.confirm).toHaveBeenCalledOnce();
+    expect(prompt).not.toHaveBeenCalled();
+  });
+
+  it("dry-run plans never reach the terminal prompt", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("ls -la");
+    const prompt = vi.fn(async () => true);
+    const code = await runExec(ctx, makeReq({ hasUI: false, canPrompt: true, printOnly: true }), {
+      ...deps,
+      prompt,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    expect(prompt).not.toHaveBeenCalled();
+    expect(deps.exec).not.toHaveBeenCalled();
+    // Deliberate --exec-print dry-run: plain marker, no hint.
+    expect(stderr).toContain("pi-exec: dry run — not executed\n");
+  });
+
+  it("banner still goes to stdout after the terminal confirm, before the child streams", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("sudo apt update", async (_c, _cwd, opts) => {
+      opts.onStdout("child out\n");
+      return { code: 0, killed: false };
+    });
+    const prompt = vi.fn(async () => true);
+    const code = await runExec(ctx, makeReq({ hasUI: false, canPrompt: true }), {
+      ...deps,
+      prompt,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    expect(stdout).toEqual([`${formatSecurityBanner("runs as root")}\n`, "child out\n"]);
+  });
+
+  it("without deps.prompt, falls back to the built-in terminalConfirm on /dev/tty", async () => {
+    const rl = makeRl("n");
+    mockRl(rl);
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("ls -la");
+    const code = await runExec(ctx, makeReq({ hasUI: false, canPrompt: true }), {
+      ...deps,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(130);
+    expect(deps.exec).not.toHaveBeenCalled();
+    expect(createReadStream).toHaveBeenCalledWith("/dev/tty");
+    expect(createWriteStream).toHaveBeenCalledWith("/dev/tty");
+    expect(rl.question).toHaveBeenCalledWith("$ ls -la\nRun this command? [y/N] ");
+    expect(rl.close).toHaveBeenCalled();
+  });
+
+  it("built-in terminalConfirm EOF/close before an answer also declines", async () => {
+    const rl = makeRl("", true);
+    mockRl(rl);
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("ls -la");
+    const code = await runExec(ctx, makeReq({ hasUI: false, canPrompt: true }), {
+      ...deps,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(130);
+    expect(rl.close).toHaveBeenCalled();
+  });
+
+  it("the headless dry-run hint explains how to actually run (D-9)", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("ls -la");
+    const prompt = vi.fn(async () => true);
+    await runExec(ctx, makeReq({ hasUI: false }), { ...deps, prompt, historyPath: historyPath() });
+    expect(stderr).toContain(`${TTY_HINT}\n`);
   });
 });
 

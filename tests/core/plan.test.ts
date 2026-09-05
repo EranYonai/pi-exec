@@ -159,6 +159,42 @@ describe("planExec", () => {
     });
     expect(plan).toEqual({ kind: "dry-run", command: "sudo apt update", warn: "runs as root" });
   });
+
+  it("headless with canPrompt and !yes → run (the adapter confirms on /dev/tty, D-9)", async () => {
+    const plan = await planExec(makeReq({ hasUI: false, canPrompt: true }), {
+      complete: fakeComplete("ls"),
+    });
+    expect(plan).toEqual({ kind: "run", command: "ls" });
+    expect(plan).not.toHaveProperty("warn");
+  });
+
+  it("headless without canPrompt → dry-run (no terminal to ask on)", async () => {
+    const plan = await planExec(makeReq({ hasUI: false }), {
+      complete: fakeComplete("ls"),
+    });
+    expect(plan).toEqual({ kind: "dry-run", command: "ls" });
+  });
+
+  it("printOnly still forces a dry-run even with canPrompt", async () => {
+    const plan = await planExec(makeReq({ hasUI: false, canPrompt: true, printOnly: true }), {
+      complete: fakeComplete("ls"),
+    });
+    expect(plan).toEqual({ kind: "dry-run", command: "ls" });
+  });
+
+  it("yes → run regardless of canPrompt", async () => {
+    const plan = await planExec(makeReq({ hasUI: false, canPrompt: true, yes: true }), {
+      complete: fakeComplete("ls"),
+    });
+    expect(plan).toEqual({ kind: "run", command: "ls" });
+  });
+
+  it("headless canPrompt + warn → run plan carries the warn reason", async () => {
+    const plan = await planExec(makeReq({ hasUI: false, canPrompt: true }), {
+      complete: fakeComplete("sudo apt update"),
+    });
+    expect(plan).toEqual({ kind: "run", command: "sudo apt update", warn: "runs as root" });
+  });
 });
 
 describe("buildUserPrompt", () => {

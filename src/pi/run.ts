@@ -9,8 +9,17 @@
  * network or a real shell.
  */
 
+import {
+  accessSync,
+  constants as fsConstants,
+  createReadStream,
+  createWriteStream,
+  type ReadStream,
+  type WriteStream,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createInterface, type Interface } from "node:readline/promises";
 import { contentText } from "@earendil-works/pi-ai";
 import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -25,10 +34,15 @@ import { createSpawnExec, type ExecFn } from "./exec";
 
 export type CompleteFn = ExecDeps["complete"];
 
+/** D-9 terminal prompt seam: ask on /dev/tty, resolve true only on y/yes. */
+export type PromptFn = (command: string, warn?: string) => Promise<boolean>;
+
 export interface RunDeps {
   complete?: CompleteFn;
   exec?: ExecFn;
   historyPath?: string;
+  prompt?: PromptFn;
+  ttyAvailable?: () => boolean;
 }
 
 /** Append-only JSONL cache: ~/.pi/agent/cache/pi-exec/history.jsonl. */
@@ -70,6 +84,90 @@ export function notify(ctx: RunCtx, text: string, level: "info" | "warning" | "e
 export function formatSecurityBanner(reason: string): string {
   return `# ⚠ pi-exec: security risk — ${reason.replace(/\r?\n/g, " ")}`;
 }
+
+/**
+ * D-9: a controlling terminal the confirm question can be asked on, without
+ * touching pi's stdout/stderr channels. Never throws.
+ */
+export function ttyAvailable(): boolean {
+  try {
+    accessSync("/dev/tty", fsConstants.R_OK | fsConstants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * D-9 default prompt: ask `Run this command? [y/N]` directly on /dev/tty —
+ * never stdout/stderr. ANY failure (no tty — including an async open error
+ * like ENXIO, EOF before an answer, stream error) resolves false; never
+ * throws, never crashes on unhandled 'error' events.
+ */
+export async function terminalConfirm(command: string, warn?: string): Promise<boolean> {
+  let rl: Interface | undefined;
+  let input: ReadStream | undefined;
+  let output: WriteStream | undefined;
+  try {
+    input = createReadStream("/dev/tty");
+    output = createWriteStream("/dev/tty");
+    rl = createInterface({ input, output });
+    // Opening /dev/tty can fail asynchronously (ENXIO without a controlling
+    // terminal) — an unhandled EventEmitter 'error' would crash the process.
+    // Race the question against those errors: the failure becomes a plain
+    // false. The extra .catch marks `failed` as handled so a late error after
+    // a normal answer cannot become an unhandled rejection.
+    const failed = new Promise<never>((_resolve, reject) => {
+      const fail = (err: unknown): void =>
+        reject(err instanceof Error ? err : new Error(String(err)));
+      input?.on("error", fail);
+      output?.on("error", fail);
+      rl?.on("error", fail);
+    });
+    failed.catch(() => {});
+    const answer = await Promise.race([
+      rl.question(
+        `${warn !== undefined ? `⚠ security risk — ${warn}\n` : ""}$ ${command}\nRun this command? [y/N] `,
+      ),
+      failed,
+    ]);
+    return /^(y|yes)$/i.test(answer.trim());
+  } catch {
+    return false;
+  } finally {
+    rl?.close();
+    input?.destroy();
+    output?.destroy();
+  }
+}
+
+/**
+ * D-10 help menu — printed by `--exec-help`, `--exec ""` and bare `/exec`.
+ */
+export const EXEC_HELP_LINES: readonly string[] = [
+  "pi-exec — describe a shell task in plain language, confirm one command, done.",
+  "",
+  "Usage:",
+  '  pi --exec "<request>"                    ask in the pi interface (TUI form)',
+  '  pi -p --no-session --exec "<request>"    recommended one-shot without the interface',
+  '  pi --exec "<request>" --exec-yes         skip the confirmation (safety lint still applies)',
+  '  pi --exec "<request>" --exec-print       print the command only, never run it',
+  '  pi --exec "<request>" --exec-timeout 30  execution timeout in seconds (default 120)',
+  "  pi --exec-history <n>                    print the last n history entries and exit",
+  "  pi --exec-help                           print this help menu and exit",
+  '  pi --exec ""                             an empty value also prints this menu',
+  "  /exec <request>                          same as --exec inside a running session",
+  "  /exec-history [n]                        recent history inside a running session",
+  "",
+  "Safety: deny-class commands never run, even with --exec-yes; warn-class risks show",
+  "their reason before you confirm; every command asks first by default, and headless",
+  "runs without a terminal fall back to a dry-run.",
+  "",
+  "Exit codes: the child command's own exit code; 130 when declined or aborted; 1 on",
+  "refusal or error; 0 for a dry-run or this help.",
+  "",
+  "History is appended to ~/.pi/agent/cache/pi-exec/history.jsonl — delete the file to reset.",
+];
 
 /** Last `maxLines` lines of a buffer, each capped at `lineCap` chars. */
 function tailLines(text: string, maxLines: number, lineCap: number): string[] {
@@ -150,6 +248,11 @@ export async function runExec(
   }
 
   if (plan.kind === "dry-run") {
+    // The no-terminal headless rule (D-9) deserves a hint about how to
+    // actually run; --exec-print dry-runs are deliberate, so no hint.
+    const dryRunMarker = !req.printOnly && !req.hasUI
+      ? "pi-exec: dry run — not executed (no terminal to confirm; pass --exec-yes to run, --exec-print to print only)"
+      : "pi-exec: dry run — not executed";
     if (ctx.hasUI) {
       ctx.ui.notify(
         plan.warn !== undefined
@@ -163,7 +266,7 @@ export async function runExec(
         process.stderr.write(`${formatSecurityBanner(plan.warn)}\n`);
       }
       process.stderr.write(`${plan.command}\n`);
-      process.stderr.write("pi-exec: dry run — not executed\n");
+      process.stderr.write(`${dryRunMarker}\n`);
     } else {
       // Print mode: banner comment line first, then ONLY the command —
       // `pi --exec ... --exec-print | sh` stays pipeable.
@@ -171,19 +274,40 @@ export async function runExec(
         process.stdout.write(`${formatSecurityBanner(plan.warn)}\n`);
       }
       process.stdout.write(`${plan.command}\n`);
-      process.stderr.write("pi-exec: dry run — not executed\n");
+      process.stderr.write(`${dryRunMarker}\n`);
     }
     await record("dry-run", plan.command, plan.warn);
     return 0;
   }
 
-  // plan.kind === "run"
-  if (!req.yes && ctx.hasUI) {
-    const confirmed = await ctx.ui.confirm(
-      "Run this command?",
-      `$ ${plan.command}${plan.warn !== undefined ? `\n\n⚠ ${plan.warn}` : ""}`,
-    );
-    if (!confirmed) {
+  // plan.kind === "run". Confirmation gate, first match wins: --exec-yes
+  // skips; UI modes ask in a dialog; print mode with a terminal (D-9) asks
+  // on /dev/tty. Without any of these, core already produced a dry-run —
+  // defensively decline if that is ever reached.
+  let ttyConfirmed = false;
+  if (!req.yes) {
+    if (ctx.hasUI) {
+      const confirmed = await ctx.ui.confirm(
+        "Run this command?",
+        `$ ${plan.command}${plan.warn !== undefined ? `\n\n⚠ ${plan.warn}` : ""}`,
+      );
+      if (!confirmed) {
+        notify(ctx, "canceled — nothing executed", "info");
+        await record("declined", plan.command, plan.warn);
+        return 130;
+      }
+    } else if (req.canPrompt === true) {
+      // D-9: the question goes to /dev/tty — never stdout/stderr.
+      const ok = await (deps.prompt ?? terminalConfirm)(plan.command, plan.warn);
+      if (!ok) {
+        notify(ctx, "canceled — nothing executed", "info");
+        await record("declined", plan.command, plan.warn);
+        return 130;
+      }
+      // The question already showed the command (+ warn) on the tty — the
+      // stderr run-report below would be a verbatim duplicate.
+      ttyConfirmed = true;
+    } else {
       notify(ctx, "canceled — nothing executed", "info");
       await record("declined", plan.command, plan.warn);
       return 130;
@@ -191,8 +315,9 @@ export async function runExec(
   }
 
   // Report the command being run. In run mode stdout belongs to the child's
-  // output — the command itself goes to stderr; only the banner may touch
-  // stdout, before the child streams.
+  // output — the command itself goes to stderr (skipped when the tty confirm
+  // already displayed it); only the banner may touch stdout, before the
+  // child streams.
   if (ctx.hasUI) {
     ctx.ui.notify(
       plan.warn !== undefined
@@ -206,7 +331,9 @@ export async function runExec(
     }
     process.stderr.write(`$ ${plan.command}\n`);
   } else {
-    process.stderr.write(`$ ${plan.command}\n`);
+    if (!ttyConfirmed) {
+      process.stderr.write(`$ ${plan.command}\n`);
+    }
     if (plan.warn !== undefined) {
       process.stdout.write(`${formatSecurityBanner(plan.warn)}\n`);
     }

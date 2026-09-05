@@ -26,11 +26,17 @@ Initial implementation of the pi-exec extension (design: `docs/plan.md`; verifie
     output; last-3 commands injected as model reference context; `formatHistoryPreview`
     newest-first
 - pi adapter (`src/pi`): `--exec`, `--exec-yes`, `--exec-print`, `--exec-timeout`,
-  `--exec-history` flags; one-shot `session_start` wiring (startup-reason guarded,
-  exit-code passthrough in print/json modes); `/exec` and `/exec-history` commands;
-  streaming `bash -lc` exec seam with timeout/abort handling (exit 124 on kill);
-  mode-aware reporting with TUI widget + RPC tail; **security-risk banner on stdout**
-  for warn-class commands (shell-comment format, pipe-safe)
+  `--exec-history`, `--exec-help` flags; one-shot `session_start` wiring
+  (startup-reason guarded, exit-code passthrough in print/json modes); `/exec` and
+  `/exec-history` commands; streaming `bash -lc` exec seam with timeout/abort handling
+  (exit 124 on kill); mode-aware reporting with TUI widget + RPC tail; **security-risk
+  banner on stdout** for warn-class commands (shell-comment format, pipe-safe)
+- **print-mode terminal confirmation (D-9)**: `pi -p --no-session --exec "…"` asks
+  `Run this command? [y/N]` directly on `/dev/tty` — pi stays fully behind the scenes,
+  no TUI. Declined → 130. Dry-run remains the default only without a terminal (CI,
+  pipes); Ctrl+D ends pi cleanly with nothing executed
+- **help menu (D-10)**: `--exec-help`, `pi --exec ""` (empty value, exit 0) and bare
+  `/exec` print the full usage/safety/exit-code menu
 - v0 standalone wrapper `scripts/pi-exec.sh` (the verified reference implementation)
 - CI (node 20/22 matrix) and publish pipeline (patch bump, provenance, GitHub release)
 - Docs: README (usage, safety model, history, troubleshooting), AGENTS.md, this changelog

@@ -7,7 +7,7 @@
  * them readable after startup); the factory itself only registers things.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_TIMEOUT_SEC,
   formatHistoryPreview,
@@ -16,7 +16,7 @@ import {
   readHistory,
   type ExecRequest,
 } from "../core";
-import { DEFAULT_HISTORY_PATH, notify, runExec, type RunDeps } from "./run";
+import { DEFAULT_HISTORY_PATH, EXEC_HELP_LINES, notify, runExec, ttyAvailable, type RunDeps } from "./run";
 
 const EXEC_USAGE = 'usage: pi --exec "<request>"';
 const EXEC_HISTORY_USAGE = "usage: --exec-history <n>";
@@ -25,6 +25,14 @@ const DEFAULT_HISTORY_LIMIT = 10;
 function setExitCode(mode: string, code: number): void {
   // D-3: print and json are equally headless — both own the process exit code.
   if (mode === "print" || mode === "json") process.exitCode = code;
+}
+
+/** D-10: the help menu, mode-aware — dialogs where they exist, otherwise the
+ * pipeable channel (print → stdout, json → stderr). */
+function printHelp(ctx: ExtensionContext): void {
+  if (ctx.hasUI) ctx.ui.notify(EXEC_HELP_LINES.join("\n"), "info");
+  else if (ctx.mode === "json") process.stderr.write(`${EXEC_HELP_LINES.join("\n")}\n`);
+  else process.stdout.write(`${EXEC_HELP_LINES.join("\n")}\n`);
 }
 
 export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
@@ -53,10 +61,24 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
     description: "Print the last N pi-exec history entries and exit",
     type: "string",
   });
+  // No default: help must not fire in every plain pi session.
+  pi.registerFlag("exec-help", {
+    description: "Print the pi-exec help menu and exit",
+    type: "boolean",
+  });
 
   pi.on("session_start", async (event, ctx) => {
     // One-shot: never re-run on /new, /resume or /reload (D-5).
     if (event.reason !== "startup") return;
+
+    // --exec-help is the highest precedence: help menu + exit 0, the exec
+    // pipeline is not invoked (D-10).
+    if (pi.getFlag("exec-help") === true) {
+      printHelp(ctx);
+      setExitCode(ctx.mode, 0);
+      await ctx.shutdown();
+      return;
+    }
 
     // --exec-history takes precedence over --exec: preview + shutdown, the
     // exec pipeline is not invoked.
@@ -82,9 +104,16 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
 
     const text = pi.getFlag("exec");
     if (text === undefined) return; // inert for normal sessions (FR6)
-    if (typeof text !== "string" || text.trim() === "") {
+    if (typeof text !== "string") {
       notify(ctx, EXEC_USAGE, "warning");
       setExitCode(ctx.mode, 1);
+      await ctx.shutdown();
+      return;
+    }
+    if (text.trim() === "") {
+      // D-10: an empty --exec value asks for help, not an error.
+      printHelp(ctx);
+      setExitCode(ctx.mode, 0);
       await ctx.shutdown();
       return;
     }
@@ -104,6 +133,11 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
       printOnly: pi.getFlag("exec-print") === true,
       timeoutSec,
       hasUI: ctx.hasUI,
+      // D-9: only print mode may confirm on /dev/tty (json keeps pure-protocol
+      // behavior; tui/rpc have dialogs).
+      ...(ctx.mode === "print" && (deps.ttyAvailable ?? ttyAvailable)()
+        ? { canPrompt: true }
+        : {}),
       // exactOptionalPropertyTypes: forward only when defined.
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     };
@@ -116,7 +150,8 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
     description: "Generate & run one shell command from a natural-language request",
     handler: async (args, ctx) => {
       if (args.trim() === "") {
-        ctx.ui.notify("usage: /exec <request>", "warning");
+        // D-10: bare /exec shows the help menu.
+        ctx.ui.notify(EXEC_HELP_LINES.join("\n"), "info");
         return;
       }
       await runExec(ctx, {

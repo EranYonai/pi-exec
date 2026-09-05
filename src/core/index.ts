@@ -66,7 +66,9 @@ export async function planExec(req: ExecRequest, deps: ExecDeps): Promise<ExecPl
   const warn = verdict.verdict === "warn" ? verdict.reason : undefined;
 
   // Headless default is dry-run — safety by construction (no one to ask).
-  if (req.printOnly || (!req.hasUI && !req.yes)) {
+  // With a controlling terminal (canPrompt, D-9) the adapter confirms on
+  // /dev/tty instead; --exec-print still forces a dry-run.
+  if (req.printOnly || (!req.hasUI && !req.yes && req.canPrompt !== true)) {
     return warn === undefined
       ? { kind: "dry-run", command: parsed.command }
       : { kind: "dry-run", command: parsed.command, warn };

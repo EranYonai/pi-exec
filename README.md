@@ -29,8 +29,14 @@ pi -e npm:pi-exec --exec "show the 10 largest directories under ~"
 ## Usage
 
 ```bash
-# one-shot, interactive: propose → confirm → stream → exit
+# one-shot, NO pi interface: propose → confirm on your terminal → stream → exit
+pi -p --no-session --exec "resize all pngs in this folder to 50%"
+
+# same, but inside the pi TUI (opens the full interface)
 pi --exec "resize all pngs in this folder to 50%"
+
+# help menu (also: pi --exec "" — an empty value)
+pi --exec-help
 
 # scripted / CI: headless auto-run, pi exits with the command's exit code
 pi -p --no-session --exec "git shortlog -sn | head -5" --exec-yes
@@ -61,15 +67,20 @@ beyond its history cache, but pi would still write a session file for the run.
 | `--exec-print` | boolean | never execute; print the proposed command only (dry run) |
 | `--exec-timeout <sec>` | string | execution timeout in seconds (default 120) |
 | `--exec-history <n>` | string | print the last N history entries and exit |
+| `--exec-help` | boolean | print the pi-exec help menu and exit (same menu for `--exec ""` and bare `/exec`) |
 
 ### Confirmation matrix
 
 | Mode | default | `--exec-yes` | `--exec-print` |
 |---|---|---|---|
 | tui / rpc | confirm dialog | run | print only |
-| print / json (headless) | **print only** (dry run) | run | print only |
+| print + terminal | **y/N prompt on /dev/tty** | run | print only |
+| print / json, no terminal | **print only** (dry run) | run | print only |
 
-Headless default is dry-run because there is no one to ask — safety by construction.
+The recommended no-interface one-shot is `pi -p --no-session --exec "…"`: pi stays fully
+behind the scenes and the confirm lands directly on your terminal
+(`$ ls -la` + `Run this command? [y/N]`). Answer `n` → exit 130, nothing executed.
+Dry-run remains the default only when there is genuinely no terminal to ask (CI, pipes).
 
 ## Safety model
 
@@ -101,6 +112,7 @@ safety lint.
 | declined confirmation | `130` |
 | dry run | `0` |
 | generation error / parse refusal / lint deny / invalid flags | `1` |
+| help menu (`--exec-help`, `--exec ""`) | `0` |
 
 ## History cache
 
@@ -139,8 +151,15 @@ npm run check        # typecheck (strict) + coverage (95% gate, all metrics)
 
 ## Troubleshooting
 
+- **`pi --exec` opens the full pi interface** — that's pi's TUI mode; an extension cannot
+  suppress it. Use the invisible one-shot instead: `pi -p --no-session --exec "…"`
+  (pi stays behind the scenes, the confirm lands on your terminal), or `scripts/pi-exec.sh`.
 - **`pi -exec "…"` (single dash) is invalid** — commander parses it as a short-flag
   cluster (`Error: Unknown option: -exec`). The invocation is always `pi --exec "…"`.
+- **`pi --exec` with no value** errors in pi's flag parser before extensions load —
+  pass an empty value (`pi --exec ""`) or use `pi --exec-help` for the menu.
+- **Ctrl+D at the terminal confirm** ends pi cleanly (exit 0, nothing executed);
+  answer `n` for an explicit decline (exit 130).
 - `--exec` needs a session start (any mode, including `-p`); `pi --help` and similar
   no-session invocations correctly do nothing.
 - A warn-class command in dry-run stdout? That banner comment is deliberate — `sh`

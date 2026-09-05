@@ -12,6 +12,7 @@ import {
   readHistory,
   type HistoryEntry,
 } from "../../src/core";
+import { EXEC_HELP_LINES } from "../../src/pi/run";
 import piExec from "../../src/pi/index";
 
 let dir: string;
@@ -119,6 +120,10 @@ function makeDeps() {
       (systemPrompt: string, userPrompt: string, opts: { maxTokens: number; signal?: AbortSignal }) => Promise<string>
     >(async () => "echo hello from exec\n"),
     exec: vi.fn(async () => ({ code: 0, killed: false })),
+    // Defaults keep every session headless (no terminal): existing dry-run
+    // behavior is unchanged; the D-9 tests override these.
+    prompt: vi.fn(async () => true),
+    ttyAvailable: vi.fn(() => false),
     historyPath,
   };
 }
@@ -196,11 +201,18 @@ async function captureStdout(body: () => Promise<void>): Promise<string[]> {
 }
 
 describe("piExec factory — registration", () => {
-  it("registers the 5 flags with the verified types", () => {
+  it("registers the 6 flags with the verified types", () => {
     const { pi, flags, registerFlag } = makePi();
     piExec(pi);
     const names = (registerFlag.mock.calls as [string, FlagOptions][]).map(([name]) => name);
-    expect(names).toEqual(["exec", "exec-yes", "exec-print", "exec-timeout", "exec-history"]);
+    expect(names).toEqual([
+      "exec",
+      "exec-yes",
+      "exec-print",
+      "exec-timeout",
+      "exec-history",
+      "exec-help",
+    ]);
     expect(flags.get("exec")?.type).toBe("string");
     expect(flags.get("exec-yes")).toMatchObject({ type: "boolean", default: false });
     expect(flags.get("exec-print")).toMatchObject({ type: "boolean", default: false });
@@ -209,6 +221,10 @@ describe("piExec factory — registration", () => {
     expect(history?.type).toBe("string");
     // No default: a default would fire the preview in every plain pi session.
     expect(history).not.toHaveProperty("default");
+    const help = flags.get("exec-help");
+    expect(help?.type).toBe("boolean");
+    // No default: help must not fire in every plain pi session.
+    expect(help).not.toHaveProperty("default");
   });
 
   it("registers /exec and /exec-history commands", () => {
@@ -287,12 +303,28 @@ describe("piExec factory — --exec one-shot", () => {
     expect(deps.complete).not.toHaveBeenCalled();
   });
 
-  it("empty --exec string → usage failure, exit 1, shutdown", async () => {
-    const stderr = await captureStderr(async () => {
+  it("empty --exec string → help menu, exit 0, no pipeline (D-10)", async () => {
+    const { stdout } = await captureBoth(async () => {
       const { pi, sessionStartHandler, flagValues } = makePi();
       const deps = makeDeps();
       piExec(pi, deps);
       flagValues.set("exec", "   ");
+      const { ctx, shutdown } = makeCtx("print");
+      await sessionStartHandler()({ reason: "startup" }, ctx);
+      expect(shutdown).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(0);
+      expect(deps.complete).not.toHaveBeenCalled();
+      expect(deps.exec).not.toHaveBeenCalled();
+    });
+    expect(stdout.join("")).toBe(`${EXEC_HELP_LINES.join("\n")}\n`);
+  });
+
+  it("non-string --exec flag value → usage failure, exit 1, shutdown", async () => {
+    const stderr = await captureStderr(async () => {
+      const { pi, sessionStartHandler, flagValues } = makePi();
+      const deps = makeDeps();
+      piExec(pi, deps);
+      flagValues.set("exec", true); // flag type confusion
       const { ctx, shutdown } = makeCtx("print");
       await sessionStartHandler()({ reason: "startup" }, ctx);
       expect(shutdown).toHaveBeenCalledOnce();
@@ -330,7 +362,10 @@ describe("piExec factory — --exec one-shot", () => {
       expect(process.exitCode).toBe(0);
     });
     expect(stdout).toEqual([]);
-    expect(stderr).toEqual(["echo hello from exec\n", "pi-exec: dry run — not executed\n"]);
+    expect(stderr).toEqual([
+      "echo hello from exec\n",
+      "pi-exec: dry run — not executed (no terminal to confirm; pass --exec-yes to run, --exec-print to print only)\n",
+    ]);
   });
 
   it("forwards ctx.signal into the ExecRequest (session_start path)", async () => {
@@ -347,6 +382,155 @@ describe("piExec factory — --exec one-shot", () => {
     const { ctx } = makeCtx("print", controller.signal);
     await sessionStartHandler()({ reason: "startup" }, ctx);
     expect(seen).toBe(controller.signal);
+  });
+});
+
+describe("piExec factory — --exec-help one-shot (D-10)", () => {
+  it("print mode: menu to stdout, exit 0, shutdown, exec pipeline NOT invoked", async () => {
+    const { stdout } = await captureBoth(async () => {
+      const { pi, sessionStartHandler, flagValues } = makePi();
+      const deps = makeDeps();
+      piExec(pi, deps);
+      flagValues.set("exec-help", true);
+      flagValues.set("exec", "list files"); // even alongside --exec
+      const { ctx, shutdown } = makeCtx("print");
+      await sessionStartHandler()({ reason: "startup" }, ctx);
+      expect(shutdown).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(0);
+      expect(deps.complete).not.toHaveBeenCalled();
+      expect(deps.exec).not.toHaveBeenCalled();
+    });
+    expect(stdout.join("")).toBe(`${EXEC_HELP_LINES.join("\n")}\n`);
+  });
+
+  it("json mode: menu to stderr, stdout untouched", async () => {
+    const { stdout, stderr } = await captureBoth(async () => {
+      const { pi, sessionStartHandler, flagValues } = makePi();
+      piExec(pi, makeDeps());
+      flagValues.set("exec-help", true);
+      const { ctx, shutdown } = makeCtx("json");
+      await sessionStartHandler()({ reason: "startup" }, ctx);
+      expect(shutdown).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(0);
+    });
+    expect(stdout).toEqual([]);
+    expect(stderr.join("")).toBe(`${EXEC_HELP_LINES.join("\n")}\n`);
+  });
+
+  it("tui mode: menu via ui.notify", async () => {
+    const { pi, sessionStartHandler, flagValues } = makePi();
+    piExec(pi, makeDeps());
+    flagValues.set("exec-help", true);
+    const { ctx, ui, shutdown } = makeCtx("tui");
+    await sessionStartHandler()({ reason: "startup" }, ctx);
+    expect(ui.notify).toHaveBeenCalledWith(EXEC_HELP_LINES.join("\n"), "info");
+    expect(shutdown).toHaveBeenCalledOnce();
+  });
+
+  it("highest precedence: beats --exec-history and --exec", async () => {
+    await appendHistoryEntry(historyPath, makeHistoryEntry({ command: "echo one" }));
+    const { stdout } = await captureBoth(async () => {
+      const { pi, sessionStartHandler, flagValues } = makePi();
+      const deps = makeDeps();
+      piExec(pi, deps);
+      flagValues.set("exec-help", true);
+      flagValues.set("exec-history", "5");
+      flagValues.set("exec", "list files");
+      const { ctx, shutdown } = makeCtx("print");
+      await sessionStartHandler()({ reason: "startup" }, ctx);
+      expect(shutdown).toHaveBeenCalledOnce();
+      expect(deps.complete).not.toHaveBeenCalled();
+    });
+    expect(stdout.join("")).toContain("--exec-help");
+    // The history preview did not run.
+    expect(stdout.join("")).not.toContain("echo one");
+  });
+
+  it("--exec-help absent (undefined) → inert like before", async () => {
+    const { pi, sessionStartHandler } = makePi();
+    const deps = makeDeps();
+    piExec(pi, deps);
+    const { ctx, shutdown } = makeCtx("print");
+    process.exitCode = 7;
+    await sessionStartHandler()({ reason: "startup" }, ctx);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(7);
+  });
+});
+
+describe("piExec factory — canPrompt wiring (D-9)", () => {
+  it("print mode + ttyAvailable true → request reaches runExec with canPrompt (prompt seam used)", async () => {
+    const { pi, sessionStartHandler, flagValues } = makePi();
+    const deps = makeDeps();
+    deps.ttyAvailable.mockReturnValue(true);
+    piExec(pi, deps);
+    flagValues.set("exec", "list files");
+    const { ctx, shutdown } = makeCtx("print");
+    await sessionStartHandler()({ reason: "startup" }, ctx);
+    expect(deps.ttyAvailable).toHaveBeenCalledOnce();
+    // canPrompt: true → the plan is "run" (not a dry-run) → the terminal
+    // prompt is asked; accepting it executes the command.
+    expect(deps.prompt).toHaveBeenCalledOnce();
+    expect(deps.exec).toHaveBeenCalledOnce();
+    expect(shutdown).toHaveBeenCalledOnce();
+    expect(process.exitCode).toBe(0);
+  });
+
+  it("print mode + ttyAvailable false → canPrompt absent → headless dry-run", async () => {
+    const { pi, sessionStartHandler, flagValues } = makePi();
+    const deps = makeDeps();
+    piExec(pi, deps);
+    flagValues.set("exec", "list files");
+    const { ctx, shutdown } = makeCtx("print");
+    await sessionStartHandler()({ reason: "startup" }, ctx);
+    expect(deps.ttyAvailable).toHaveBeenCalledOnce();
+    expect(deps.prompt).not.toHaveBeenCalled();
+    expect(deps.exec).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(0);
+  });
+
+  it("tui mode never checks the tty (dialogs exist there)", async () => {
+    const { pi, sessionStartHandler, flagValues } = makePi();
+    const deps = makeDeps();
+    deps.ttyAvailable.mockReturnValue(true);
+    piExec(pi, deps);
+    flagValues.set("exec", "list files");
+    const { ctx, ui, shutdown } = makeCtx("tui");
+    await sessionStartHandler()({ reason: "startup" }, ctx);
+    expect(deps.ttyAvailable).not.toHaveBeenCalled();
+    expect(deps.prompt).not.toHaveBeenCalled();
+    expect(ui.confirm).toHaveBeenCalledOnce();
+    expect(shutdown).toHaveBeenCalledOnce();
+  });
+
+  it("json mode never checks the tty (pure-protocol behavior)", async () => {
+    const { pi, sessionStartHandler, flagValues } = makePi();
+    const deps = makeDeps();
+    deps.ttyAvailable.mockReturnValue(true);
+    piExec(pi, deps);
+    flagValues.set("exec", "list files");
+    const { ctx, shutdown } = makeCtx("json");
+    await sessionStartHandler()({ reason: "startup" }, ctx);
+    expect(deps.ttyAvailable).not.toHaveBeenCalled();
+    expect(deps.prompt).not.toHaveBeenCalled();
+    expect(shutdown).toHaveBeenCalledOnce();
+  });
+
+  it("declined terminal confirm → 130 + declined history entry", async () => {
+    const { pi, sessionStartHandler, flagValues } = makePi();
+    const deps = makeDeps();
+    deps.ttyAvailable.mockReturnValue(true);
+    deps.prompt.mockResolvedValue(false);
+    piExec(pi, deps);
+    flagValues.set("exec", "list files");
+    const { ctx, shutdown } = makeCtx("print");
+    await sessionStartHandler()({ reason: "startup" }, ctx);
+    expect(deps.prompt).toHaveBeenCalledOnce();
+    expect(deps.exec).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(130);
+    expect(shutdown).toHaveBeenCalledOnce();
+    const entries = await readHistory(historyPath);
+    expect(entries[0]).toMatchObject({ kind: "declined", command: "echo hello from exec" });
   });
 });
 
@@ -443,13 +627,13 @@ describe("piExec factory — --exec-history one-shot", () => {
 });
 
 describe("piExec factory — /exec command", () => {
-  it("empty args → usage notify, pipeline not invoked", async () => {
+  it("empty args → help menu notify, pipeline not invoked (D-10)", async () => {
     const { pi, commands } = makePi();
     const deps = makeDeps();
     piExec(pi, deps);
     const { ctx, ui, shutdown } = makeCtx("tui");
     await commands.get("exec")!.handler("", ctx as ExtensionCommandContext);
-    expect(ui.notify).toHaveBeenCalledWith("usage: /exec <request>", "warning");
+    expect(ui.notify).toHaveBeenCalledWith(EXEC_HELP_LINES.join("\n"), "info");
     expect(deps.complete).not.toHaveBeenCalled();
     expect(shutdown).not.toHaveBeenCalled();
   });
