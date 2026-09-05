@@ -50,6 +50,7 @@ Verified against `@earendil-works/pi-coding-agent` 0.85.1's actual `.d.ts` files
 | D-4 | devDependency versions are `^0.85.1` (not `^0.84.2`) | match installed pi runtime on this machine |
 | D-5 | One-shot `session_start` handler guards `event.reason === "startup"` | prevents accidental re-run on `/new`/`/resume`/`/reload` re-fires |
 | D-6 | Factory signature is `piExec(pi: ExtensionAPI, deps: RunDeps = {})` | test seam, mirrors pi-weave's `deps` pattern; jiti calls it with one arg in production |
+| D-7 | Warn-class commands emit a **security-risk banner to stdout** (user requirement): a shell-comment line `# ⚠ pi-exec: security risk — <reason>` printed to stdout before the command/output, in print-mode dry-run AND print-mode run. Comment format keeps `--exec-print \| sh` piping working (sh ignores comment lines) while making the risk impossible to miss. Clean (ok) commands keep stdout pure. json mode prints the banner to stderr (stdout is pi's JSON channel); TUI/RPC show the reason in the confirm dialog and notify. | user requirement: "on unsecure commands, pi-exec should flag it in stdout to user" |
 
 ## 3. Architecture (plan §4.2, unchanged)
 
@@ -306,15 +307,16 @@ Flow:
 2. `plan = await planExec(req, { complete })`.
 3. `refuse`/`error` → report reason (UI: notify `"warning"`/`"error"`; headless: stderr with
    `pi-exec: ` prefix); return `1`.
-4. `dry-run` → report command + warn + `(dry run — not executed)`: UI → notify; print mode →
-   **stdout gets ONLY the command line** (pipeable: `pi --exec ... --exec-print | sh` must
-   work), status/warn to stderr; json mode → stderr. Return `0`.
+4. `dry-run` → report command + warn + `(dry run — not executed)`: UI → single notify — when warn present the notify text is `⚠ security risk — <warn>\n$ <command>` with level `"warning"`, else `$ <command>` with level `"info"`; **print mode → stdout gets the security banner line FIRST when warn is present** (`formatSecurityBanner(warn)`, see below), then ONLY the command line (pipeable: `pi --exec ... --exec-print | sh` must still work — sh ignores comment lines); status/dry-run marker to stderr; json mode → banner + command + status all to stderr. Return `0`.
 5. `run`:
    a. `if (!req.yes && ctx.hasUI)` → `ctx.ui.confirm("Run this command?",
       "$ " + command + (warn ? "\n\n⚠ " + warn : ""))`; declined → notify `"canceled — nothing
       executed"` (info) / stderr in headless, return `130`.
-   b. Report the command being run (UI → notify; print → stderr `$ <command>`; json → stderr).
-      Never write the command to stdout in run mode — stdout belongs to the child's output.
+   b. Report the command being run (UI → notify, with the `⚠ security risk — <warn>` prefix
+      at level `"warning"` when warn present; print → stderr `$ <command>`; json → stderr).
+      **When warn is present in headless print mode, the security banner line goes to STDOUT
+      before the child streams** (D-7): `process.stdout.write(formatSecurityBanner(warn) + "\n")`.
+      Never write the command itself to stdout in run mode — stdout belongs to the child's output.
    c. Compose abort signal: `AbortSignal.any(req.signal ? [req.signal,
       AbortSignal.timeout(req.timeoutSec * 1000)] : [AbortSignal.timeout(req.timeoutSec * 1000)])`.
    d. Execute via exec seam. Stream handling by mode:
@@ -330,6 +332,11 @@ Flow:
 
 Helper `notify(ctx, text, level)`: `ctx.hasUI ? ctx.ui.notify(text, level) :
 process.stderr.write("pi-exec: " + text + "\n")`.
+
+Helper `formatSecurityBanner(reason: string): string` — exported from `src/pi/run.ts` for
+tests: returns `` `# ⚠ pi-exec: security risk — ${reason}` `` on a single line (replace any
+newlines in reason with spaces — reasons come from the rule table and are single-line, but
+be defensive).
 
 ### 5.3 `src/pi/index.ts` (factory)
 
@@ -402,9 +409,14 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
   `!yes && hasUI`; confirm message contains command and warn reason; declined→130, no exec;
   dry-run→0, no exec, no confirm; headless default dry-run; headless yes→exec; exit passthrough
   (fake exec 42→42); killed→124; model null→1; print-mode stdout purity (dry-run stdout is
-  exactly the command; run-mode stdout receives only child chunks — spy on process.stdout);
+  exactly the command for clean commands); **security banner (D-7): dry-run + warn in print
+  mode → stdout receives `formatSecurityBanner(warn)` line then the command line; clean
+  dry-run → stdout is ONLY the command (no banner); headless run + warn + yes → banner line
+  to stdout BEFORE child chunks; json mode → banner to stderr, stdout untouched; UI dry-run
+  + warn → single warning notify containing both the risk text and the command**;
   tui widget updates + final notify; rpc tail notify; req.signal flows to exec opts.signal;
-  timeout composition (exec receives a non-aborted signal).
+  timeout composition (exec receives a non-aborted signal); banner newline-safety (reason with
+  embedded newline collapses to spaces).
 - `index.test.ts` (fake pi harness + fake deps): registers 4 flags + command; flag absent →
   inert (no shutdown, no exitCode); flag present → runExec runs end-to-end with fake deps →
   shutdown called + exitCode set (print mode); exitCode NOT set in tui mode; reason
