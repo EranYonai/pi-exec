@@ -1,0 +1,39 @@
+{
+  "name": "pi-exec",
+  "version": "0.1.0",
+  "description": "Natural language → one shell command → confirm → run. A lightweight pi extension: pi --exec \"explanation of command\".",
+  "type": "module",
+  "sideEffects": false,
+  "publishConfig": { "access": "public" },
+  "keywords": ["pi-package", "cli", "shell", "ai", "productivity"],
+  "license": "MIT",
+  "author": "Eran Yonai <yonai.eran@gmail.com>",
+  "repository": { "type": "git", "url": "git+https://github.com/EranYonai/pi-exec.git" },
+  "homepage": "https://github.com/EranYonai/pi-exec#readme",
+  "bugs": "https://github.com/EranYonai/pi-exec/issues",
+  "engines": { "node": ">=20.13.0" },
+  "exports": { "./core": "./src/core/index.ts" },
+  "files": ["src", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": ["./src/pi/index.ts"]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run coverage",
+    "prepublishOnly": "npm run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^3.2.4",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.4"
+  }
+}

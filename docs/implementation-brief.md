@@ -133,6 +133,7 @@ export const EXEC_SYSTEM_PROMPT = [
   "Rules: no markdown, no code fences, no backticks, no quotes around the output,",
   "no explanation, no commentary. One line. If the request needs multiple steps or",
   "cannot be done with one command, output exactly: NOT_ONE_COMMAND: <reason>.",
+  "Never use bash history expansion (!! or !N) — write commands out in full.",
   "Target shell: POSIX/bash. Working directory is the user's current directory.",
 ].join("\n");
 
@@ -169,9 +170,15 @@ Algorithm (in order):
 7. Any remaining backtick anywhere in the line → refusal (broken fence, or legacy command
    substitution — refused loudly rather than guessed; prose like ``run `ls` to list`` is
    caught here).
-8. Strip a leading shell-prompt marker: `/^[$%>]\s+/`.
-9. Re-check empty → refusal. Length > `MAX_COMMAND_LENGTH` → refusal.
-10. Return `{ kind: "command", command: line }`.
+8. **Bash history expansion** (added in review): a word starting with `!` followed by `!`,
+   `-`, `?` or an alphanumeric (`!!`, `!-2`, `!ls`) → refusal — event designators are
+   silent no-ops in non-interactive `bash -lc`. Pattern:
+   `/(?:^|\s)!(?:!|-|\?|[a-z0-9])/i` (`! grep x` negation and `echo 'hi!!'` do not match).
+   The system prompt also forbids them (§4.2 line: "Never use bash history expansion
+   (!! or !N) — write commands out in full.").
+9. Strip a leading shell-prompt marker: `/^[$%>]\s+/`.
+10. Re-check empty → refusal. Length > `MAX_COMMAND_LENGTH` → refusal.
+11. Return `{ kind: "command", command: line }`.
 
 ### 4.4 `src/core/lint.ts`
 
