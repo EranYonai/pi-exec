@@ -131,7 +131,8 @@ pi --exec "…prompt…"
         4. lint              hard-deny patterns (§4.4) → refuse + exit;
                             soft-warn patterns → flag in the confirm dialog
         5. confirm           TUI/RPC: ctx.ui.confirm("Run this command?", cmd)
-                            print/json (hasUI=false): default DRY-RUN
+                            print + terminal: y/N prompt on /dev/tty (pi stays invisible)
+                            headless without a terminal (hasUI=false): default DRY-RUN
                             --exec-yes skips; --exec-print forces print-only
         6. execute           spawn("bash", ["-lc", cmd]) in ctx.cwd, stream stdout+stderr,
                             kill on ctx.signal / timeout (default 120s, flag-overridable)
@@ -179,15 +180,19 @@ network or spawn a real shell.
 | `--exec-print` | boolean | never execute; print the proposed command only (dry run) |
 | `--exec-timeout <sec>` | number | execution timeout, default 120 |
 | `--exec-history <n>` | string | print the last N cache entries (newest first) and exit; `/exec-history [n]` is the in-session form |
+| `--exec-help` | boolean | print the pi-exec help menu and exit (same menu for `--exec ""` and bare `/exec`) |
 
 Confirmation matrix:
 
 | Mode | default | `--exec-yes` | `--exec-print` |
 |---|---|---|---|
 | tui / rpc | confirm dialog | run | print only |
-| print / json (headless) | **print only** | run | print only |
+| print + controlling terminal | **y/N prompt on /dev/tty** | run | print only |
+| print / json, no terminal | **print only** (dry run) | run | print only |
 
-Headless default is dry-run because there is no one to ask — safety by construction.
+Headless default is dry-run because there is no one to ask — but when a controlling terminal
+exists, the extension asks directly on /dev/tty (pi stays behind the scenes, no TUI), so the
+recommended one-shot is `pi -p --no-session --exec "…"`.
 
 ### 4.4 Safety model
 
@@ -257,13 +262,14 @@ old blanket "no persistence" rule for this one artifact; nothing else is ever wr
 | # | Requirement |
 |---|---|
 | FR1 | `pi --exec "<text>"` proposes exactly one shell command derived from `<text>` |
-| FR2 | Proposed command is confirmed in TUI/RPC before execution; headless defaults to dry-run |
+| FR2 | Proposed command is confirmed before execution — dialog in TUI/RPC, terminal y/N prompt (on /dev/tty) in print mode when a controlling terminal exists; headless without a terminal defaults to dry-run |
 | FR3 | Execution streams stdout/stderr live; supports `--exec-timeout`, Ctrl+C abort |
 | FR4 | Exit code of `pi` (print mode) equals the command's exit code; refusals exit non-zero |
 | FR5 | `/exec <text>` works inside a running session without ending it |
 | FR6 | Absent flag ⇒ extension is inert (no events handled beyond registration, no status, no writes) |
 | FR7 | No-model, empty-parse, and lint-deny paths all produce a clear message and correct exit code |
 | FR8 | Every outcome is appended to the history cache; `/exec-history [n]` and `--exec-history <n>` preview it; the last 3 commands feed the model as reference context |
+| FR9 | `--exec-help`, `--exec ""` (empty value) and bare `/exec` print the pi-exec help menu (flag forms exit 0, no exec pipeline) |
 
 ### Safety
 
@@ -307,7 +313,10 @@ pi -e npm:pi-exec --exec "find all pdf files larger than 50MB in my home folder"
 # install
 pi install npm:pi-exec
 
-# one-shot, interactive: propose → confirm → stream → exit
+# one-shot, interactive, NO pi interface: propose → confirm on your terminal → stream → exit
+pi -p --no-session --exec "resize all pngs in this folder to 50%"
+
+# same, but inside the pi TUI (opens the full interface)
 pi --exec "resize all pngs in this folder to 50%"
 
 # scripted / CI: headless auto-run, pi exits with the command's exit code
@@ -327,6 +336,9 @@ pi --exec-history 10
 
 # same, inside a session
 /exec-history 5
+
+# help menu (also: pi --exec "" — an empty value)
+pi --exec-help
 ```
 
 Docs promise: **the model proposes; lint gates; you decide.** `--exec-yes` is
@@ -638,6 +650,8 @@ feature and keeps the extension honest with pi's "no background resources" rule.
 | `tests/core/purity.test.ts` | scans src/core for `@earendil-works` imports (NR3) | fs scan |
 | `tests/core/history.test.ts` | append/read roundtrip, malformed-line skip, preview formatting, limit parsing | tmpdir fs |
 | `tests/pi/run.test.ts` (extends) | history entry appended per outcome via a `historyPath` seam | tmpdir fs |
+| `tests/pi/run.test.ts` (extends) | terminal y/N confirm via a `deps.prompt` seam — called only when `!hasUI && canPrompt && !yes`; decline/EOF → 130 | fake `prompt` |
+| `tests/pi/index.test.ts` (extends) | `--exec-help` / `--exec ""` → help menu + exit 0, no exec; bare `/exec` → menu lines | fakes |
 
 No test touches a network, spawns a real shell, or loads jiti — adapter tests exercise the
 same functions the factory wires, against fakes.

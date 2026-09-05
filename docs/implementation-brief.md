@@ -52,6 +52,8 @@ Verified against `@earendil-works/pi-coding-agent` 0.85.1's actual `.d.ts` files
 | D-6 | Factory signature is `piExec(pi: ExtensionAPI, deps: RunDeps = {})` | test seam, mirrors pi-weave's `deps` pattern; jiti calls it with one arg in production |
 | D-7 | Warn-class commands emit a **security-risk banner to stdout** (user requirement): a shell-comment line `# ⚠ pi-exec: security risk — <reason>` printed to stdout before the command/output, in print-mode dry-run AND print-mode run. Comment format keeps `--exec-print \| sh` piping working (sh ignores comment lines) while making the risk impossible to miss. Clean (ok) commands keep stdout pure. json mode prints the banner to stderr (stdout is pi's JSON channel); TUI/RPC show the reason in the confirm dialog and notify. | user requirement: "on unsecure commands, pi-exec should flag it in stdout to user" |
 | D-8 | **History cache** (plan §4.6): append-only JSONL at `~/.pi/agent/cache/pi-exec/history.jsonl`, one entry per outcome; last-3 commands injected as model reference context; `/exec-history [n]` + `--exec-history <n>` preview. Replaces plan.md's original "no persistence" rule (§4.4.5/SR4 amended). | owner request: "keep input/output history somewhere in disk cache … super lightweight" |
+| D-9 | **Print-mode terminal confirm** (plan §4.3 matrix): in print mode with a controlling terminal, the extension asks `Run this command? [y/N]` directly on `/dev/tty` (question + command text go to the tty, never stdout/stderr); declined/EOF/no-tty → 130. Dry-run default now applies ONLY when headless without a terminal (CI/pipes). Recommended no-interface one-shot: `pi -p --no-session --exec "…"`. | owner request: "I don't want to open the pi interface in --exec invocations… behind the scenes is okay" — the TUI itself cannot be suppressed by an extension (it renders before session_start), so pi is kept behind the scenes via `-p` and the confirm moves to the terminal |
+| D-10 | **Help menu** (plan FR9): `--exec-help` boolean flag + `--exec ""` (empty value, previously usage-error exit 1 → now help, exit 0) + bare `/exec` all print `EXEC_HELP_LINES`; flag forms exit 0 and never invoke the exec pipeline. (`--exec` with NO value cannot be intercepted — pi's flag parser errors before extensions load; users are told to pass an empty value.) | owner request: "we need to show help menu… help, -h, --help, -help, or empty invocations" |
 
 ## 3. Architecture (plan §4.2, unchanged)
 
@@ -87,6 +89,7 @@ export interface ExecRequest {
   hasUI: boolean;
   signal?: AbortSignal;          // exactOptionalPropertyTypes: never assign undefined explicitly
   recentCommands?: readonly string[]; // last-3 history commands passed to the model as reference
+  canPrompt?: boolean;           // a controlling terminal exists: print mode may confirm on /dev/tty
 }
 
 export type HistoryEntryKind = "run" | "dry-run" | "declined" | "refuse" | "error";
@@ -271,8 +274,9 @@ export async function planExec(req: ExecRequest, deps: ExecDeps): Promise<ExecPl
 3. `parseModelOutput(raw)` refusal → `{ kind: "refuse", reason, exitCode: 1 }`.
 4. `lintCommand(cmd)` deny → `{ kind: "refuse", reason: "safety lint denied: <reason>", exitCode: 1 }`.
 5. Warn reason captured when verdict is warn.
-6. `if (req.printOnly || (!req.hasUI && !req.yes))` → `{ kind: "dry-run", command, warn? }`
-   (headless default is dry-run — safety by construction).
+6. `if (req.printOnly || (!req.hasUI && !req.yes && req.canPrompt !== true))` →
+   `{ kind: "dry-run", command, warn? }` (headless without a terminal defaults to dry-run —
+   safety by construction; with a terminal, D-9 lets the adapter confirm on /dev/tty).
 7. Else → `{ kind: "run", command, warn? }`.
 
 Build objects with conditional spreads for optional `warn`/`signal` — never assign
@@ -334,7 +338,7 @@ export function createSpawnExec(): ExecFn;
 
 ```ts
 export type CompleteFn = ExecDeps["complete"];
-export interface RunDeps { complete?: CompleteFn; exec?: ExecFn; historyPath?: string }
+export interface RunDeps { complete?: CompleteFn; exec?: ExecFn; historyPath?: string; prompt?: PromptFn; ttyAvailable?: () => boolean }
 export async function runExec(
   ctx: ExtensionContext | ExtensionCommandContext,
   req: ExecRequest,
@@ -364,9 +368,17 @@ Flow:
    `pi-exec: ` prefix); return `1`.
 4. `dry-run` → report command + warn + `(dry run — not executed)`: UI → single notify — when warn present the notify text is `⚠ security risk — <warn>\n$ <command>` with level `"warning"`, else `$ <command>` with level `"info"`; **print mode → stdout gets the security banner line FIRST when warn is present** (`formatSecurityBanner(warn)`, see below), then ONLY the command line (pipeable: `pi --exec ... --exec-print | sh` must still work — sh ignores comment lines); status/dry-run marker to stderr; json mode → banner + command + status all to stderr. Return `0`.
 5. `run`:
-   a. `if (!req.yes && ctx.hasUI)` → `ctx.ui.confirm("Run this command?",
-      "$ " + command + (warn ? "\n\n⚠ " + warn : ""))`; declined → notify `"canceled — nothing
-      executed"` (info) / stderr in headless, return `130`.
+   a. Confirmation gate, first match wins:
+      - `req.yes` → skip (no prompt).
+      - `ctx.hasUI` → `ctx.ui.confirm("Run this command?",
+        `"$ " + command + (warn ? "\n\n⚠ " + warn : "")`); declined → notify `"canceled —
+        nothing executed"` (info), record `declined`, return `130`.
+      - `req.canPrompt === true` → `const ok = await (deps.prompt ?? terminalConfirm)(
+        command, warn)` — the question goes to `/dev/tty` (D-9), never stdout/stderr;
+        `ok === false` (declined, EOF, no tty, any error) → stderr `"pi-exec: canceled —
+        nothing executed"`, record `declined`, return `130`.
+      - otherwise: core already made this a dry-run; defensively treat as declined if
+        ever reached.
    b. Report the command being run (UI → notify, with the `⚠ security risk — <warn>` prefix
       at level `"warning"` when warn present; print → stderr `$ <command>`; json → stderr).
       **When warn is present in headless print mode, the security banner line goes to STDOUT
@@ -399,6 +411,42 @@ tests: returns `` `# ⚠ pi-exec: security risk — ${reason}` `` on a single li
 newlines in reason with spaces — reasons come from the rule table and are single-line, but
 be defensive).
 
+**D-9 terminal confirm helpers** (in `src/pi/run.ts`, exported for the factory/tests):
+
+```ts
+export type PromptFn = (command: string, warn?: string) => Promise<boolean>;
+export function ttyAvailable(): boolean;
+export function terminalConfirm(command: string, warn?: string): Promise<boolean>;
+```
+
+- `ttyAvailable()`: try `accessSync("/dev/tty", R_OK | W_OK)` → true; any error → false.
+  Never throws.
+- `terminalConfirm` (the default `deps.prompt`): open `/dev/tty` read+write
+  (`node:fs` createReadStream/createWriteStream + `node:readline/promises`), ask
+  `rl.question` with the text `[warn ? `⚠ security risk — ${warn}\n` : ""] +
+  `$ ${command}\n` + `Run this command? [y/N] ``, close rl, return
+  `/^(y|yes)$/i.test(answer.trim())`. ANY failure (no tty, EOF/close before answer,
+  stream error) → `false` — never throws, never touches stdout/stderr.
+- Dry-run marker hint (print/json only): when the dry-run came from the no-terminal
+  headless rule (i.e. `!req.printOnly && !req.hasUI`), stderr says
+  `pi-exec: dry run — not executed (no terminal to confirm; pass --exec-yes to run,
+  --exec-print to print only)` instead of the plain `pi-exec: dry run — not executed`.
+
+**D-10 help menu** (in `src/pi/run.ts`):
+
+```ts
+export const EXEC_HELP_LINES: readonly string[];
+```
+
+Content (~15–25 lines, exact wording worker's choice within these rules): one-line pitch;
+usage examples for all five flags including the recommended no-interface one-shot
+`pi -p --no-session --exec "…"` and the TUI form; `/exec` + `/exec-history` in-session
+commands; safety summary (deny never runs even with --exec-yes; warn shows its reason;
+confirm-by-default; headless without a terminal defaults to dry-run); exit codes
+(child's own, 130 declined, 1 refusal/error, 0 dry-run/help); history path +
+"delete the file to reset"; note that `--exec ""` also prints this menu. Tests assert
+substrings: `--exec-help`, `--exec-yes`, `--exec-history`, `/exec-history`, `130`, `~/.pi/agent/cache`.
+
 ### 5.3 `src/pi/index.ts` (factory)
 
 ```ts
@@ -413,8 +461,13 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
   - `exec-history` — string — `Print the last N pi-exec history entries and exit` —
     **NO `default`** (a default would fire the preview in every plain `pi` session;
     absent → undefined → skipped)
+  - `exec-help` — boolean — `Print the pi-exec help menu and exit` — **NO `default`**
 - `pi.on("session_start", async (event, ctx) => { ... })`:
   - `if (event.reason !== "startup") return;` (D-5)
+  - `pi.getFlag("exec-help") === true` → print `EXEC_HELP_LINES` (mode-aware: print →
+    stdout; json → stderr; TUI/RPC → `ctx.ui.notify(lines.join("\n"), "info")`),
+    `setExitCode(mode, 0)`, `await ctx.shutdown(); return;` (D-10, highest precedence —
+    the exec pipeline is NOT invoked).
   - `const histRaw = pi.getFlag("exec-history")`; when it is a non-empty string →
     history-preview one-shot (takes precedence over `--exec`; the exec pipeline is NOT
     invoked): `const limit = parseHistoryLimit(histRaw)` — null → usage failure (message
@@ -423,12 +476,16 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
     `const lines = formatHistoryPreview(entries, limit)` → print mode: lines to **stdout**
     (preview is data); json mode: lines to stderr; TUI/RPC: `ctx.ui.notify(lines.join("\n"),
     "info")`. Then `process.exitCode = 0` in print/json, `await ctx.shutdown(); return;`.
-  - `const text = pi.getFlag("exec")`; `undefined` → return (FR6 inert); `""`/whitespace →
-    usage failure (`pi --exec "<request>"`), exit code 1, shutdown.
+  - `const text = pi.getFlag("exec")`; `undefined` → return (FR6 inert); `typeof text !==
+    "string"` → usage failure, exit 1, shutdown; `text.trim() === ""` → **help menu**
+    (EXEC_HELP_LINES, same mode-aware output as `--exec-help`), exit 0, shutdown (D-10 —
+    was a usage failure at exit 1).
   - `parseTimeoutSec(pi.getFlag("exec-timeout"))` → null → failure, exit 1, shutdown.
   - Build `ExecRequest`: `{ text, cwd: ctx.cwd, yes: pi.getFlag("exec-yes") === true,
     printOnly: pi.getFlag("exec-print") === true, timeoutSec, hasUI: ctx.hasUI,
-    ...(ctx.signal ? { signal: ctx.signal } : {}) }`.
+    ...(ctx.mode === "print" && (deps.ttyAvailable ?? ttyAvailable)() ? { canPrompt: true } : {}),
+    ...(ctx.signal ? { signal: ctx.signal } : {}) }` (canPrompt only in print mode —
+    json keeps pure-protocol behavior, tui/rpc have dialogs).
   - `const code = await runExec(ctx, req, deps)`.
   - `if (ctx.mode === "print" || ctx.mode === "json") process.exitCode = code;` (D-3)
   - `await ctx.shutdown();` — one-shot.
@@ -450,6 +507,7 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
 | dry-run (`--exec-print`, or headless without `--exec-yes`) | `0` |
 | executed | child's exit code (`124` when killed by timeout/abort) |
 | `--exec-history` / `/exec-history` preview | `0` — empty cache included (message, not error); invalid limit → `1` |
+| `--exec-help` / `--exec ""` help menu | `0` (help, not an error) |
 
 ## 7. Tooling & thresholds
 
@@ -480,7 +538,9 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
   NOT_ONE_COMMAND→refuse; empty model output→refuse; complete throws→error; empty
   request→error; printOnly→dry-run; headless+!yes→dry-run; headless+yes→run; tui+!yes→run;
   signal forwarded to complete; maxTokens is 300; recentCommands (non-empty) appear in the
-  user prompt captured by the fake complete; empty recentCommands → no history section.
+  user prompt captured by the fake complete; empty recentCommands → no history section;
+  **canPrompt matrix (D-9): headless (hasUI=false) + canPrompt + !yes → run; headless
+  without canPrompt → dry-run; printOnly still forces dry-run; yes → run regardless**.
 - `purity.test.ts`: scan `src/core/**/*.ts` sources — forbid `@earendil-works`, `typebox`,
   and `from "../pi` / `from './pi` adapter imports (read files, regex import statements).
 - `history.test.ts` (tmpdir fs, no mocks): append/read roundtrip preserves order;
@@ -502,16 +562,24 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
   every outcome (run/dry-run/declined/refuse/error/no-model) appends exactly one entry with
   the right kind and fields (exitCode only for run; warn only when lint warned); runExec
   still returns the correct exit code when historyPath points somewhere unwritable;
-  recentCommands are loaded from the history file and reach the fake complete's user prompt.
-- `index.test.ts` (fake pi harness + fake deps): registers 5 flags + 2 commands; flag absent →
+  recentCommands are loaded from the history file and reach the fake complete's user prompt;
+  **terminal confirm (D-9): `deps.prompt` called exactly when `!hasUI && canPrompt && !yes`
+  (not when yes, not when hasUI, not on dry-run plans); prompt → true: exec runs, banner still
+  goes to stdout after the confirm; prompt → false: no exec, declined history entry, 130;
+  dry-run from the no-terminal rule prints the `--exec-yes` hint on stderr (printOnly dry-run
+  prints the plain marker)**.
+- `index.test.ts` (fake pi harness + fake deps): registers 6 flags + 2 commands; flag absent →
   inert (no shutdown, no exitCode); flag present → runExec runs end-to-end with fake deps →
   shutdown called + exitCode set (print mode); exitCode NOT set in tui mode; reason
-  `reload`/`new` → inert; empty flag string → usage failure; invalid timeout → failure;
-  `/exec` empty args → usage notify; `/exec` valid → runs without shutdown;
+  `reload`/`new` → inert; **empty flag string → help menu printed, exit 0 (not a usage
+  failure anymore)**; invalid timeout → failure;
+  `/exec` empty args → help menu lines notify; `/exec` valid → runs without shutdown;
   `--exec-history` set → preview printed (print mode: stdout), shutdown, exit 0, exec
   pipeline NOT invoked; `--exec-history` invalid → usage failure exit 1; `/exec-history`
   command → notify with preview lines (limit from arg, default 10); `/exec-history` invalid
-  arg → usage warning.
+  arg → usage warning; **`--exec-help` → menu printed (print mode: stdout), exit 0, shutdown,
+  exec pipeline NOT invoked; canPrompt wiring: fake `deps.ttyAvailable` true + print mode →
+  request reaches runExec with canPrompt true; false → absent**.
 - `exec.test.ts`: vi.mock child_process (see §5.1).
 
 ## 9. Acceptance for the whole implementation
