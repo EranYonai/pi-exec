@@ -56,27 +56,26 @@ One name, everywhere: repo `EranYonai/pi-exec`, npm `pi-exec`, flag stem `--exec
 (single dash) belongs in a troubleshooting note, not in usage examples — it is a real
 error users will type.
 
-## 2.5 v0 — the `pi-exec` wrapper script (already implemented & verified)
+## 2.5 The `pi-exec` wrapper — the short, friendly invocation
 
-Before the extension exists, the standalone wrapper delivers the same UX **today**, with
-zero publishing: `~/.local/bin/pi-exec` on this machine (installed as `magic-exec`, renamed
-when the project settled on pi-exec) and `scripts/pi-exec.sh` in
-the repo once P0 lands.
+`pi -p --no-session --exec "…"` is correct but not friendly to type, so the wrapper is the
+product's face: `scripts/pi-exec.sh` (installed as `pi-exec` on PATH) delegates to the
+extension — the extension stays the whole engine (contract, parse, lint, terminal
+confirm, banner, history), the script is just the short launcher:
 
 ```bash
 pi-exec "find all pdf files larger than 50MB in my home folder"
+pi-exec "count files in dir" --exec-model ollama/glm-5.3-flash:cloud
 ```
 
-Flow: join argv into a prompt → `pi -p --no-session --system-prompt "$CONTRACT" "$PROMPT"
-(`< /dev/null` — **pi drains piped stdin as prompt input**, which otherwise swallows the
-confirmation answer; found by testing) → strip fences, require exactly one non-empty
-line → refuse `NOT_ONE_COMMAND: <reason>` → print command in green → `read` y/N →
-`exec bash -lc "$CMD"` (exit-code passthrough; 1 = refusal/parse, 130 = declined).
+Contract: first argument is the request (quote it), remaining arguments pass through to
+pi (`--exec-yes`, `--exec-print`, `--exec-model`, …). Equivalent to
+`pi -p --no-session --exec "<request>" <flags…>`.
 
-Verified end-to-end on this machine (glm-5.3:cloud): clean generation, decline path,
-approve path with correct exit code, stdin-closed edge, no-arg usage. The extension (§4)
-is the same pipeline with lint, streaming, and flags — the script is the reference
-implementation of parse + confirm.
+History: the v0 wrapper (pre-extension) did its own `pi -p --system-prompt` generation with
+bash-side parse/confirm — that version lives in git history and taught us the stdin-drain
+trap (`< /dev/null` — pi drains piped stdin as prompt input). Delegation replaced it once the
+extension reached parity plus lint/history/flags; the script is now intentionally trivial.
 
 ---
 
@@ -124,8 +123,9 @@ pi --exec "…prompt…"
                                         │ yes
                                         ▼
         1. resolve model     ctx.model? — null → notify + shutdown(exit 1)
-        2. generate          modelRegistry.complete(model, CONTRACT_PROMPT + user text,
-                              { maxTokens: 300, signal })   [ONE completion, no tools]
+        2. generate          modelRegistry.complete(model — session default or --exec-model
+                              override, CONTRACT_PROMPT + user text,
+                              { maxTokens: 300, reasoning: "minimal", signal })   [ONE completion, no tools]
         3. parse             strip code fences/quotes/whitespace; reject >1 command line,
                             refuse "I can't" chatter → show raw + exit
         4. lint              hard-deny patterns (§4.4) → refuse + exit;
@@ -181,6 +181,7 @@ network or spawn a real shell.
 | `--exec-timeout <sec>` | number | execution timeout, default 120 |
 | `--exec-history <n>` | string | print the last N cache entries (newest first) and exit; `/exec-history [n]` is the in-session form |
 | `--exec-help` | boolean | print the pi-exec help menu and exit (same menu for `--exec ""` and bare `/exec`) |
+| `--exec-model <provider/model-id>` | string | model override for generation (resolve via the registry; unknown → exit 1). Point it at a flash tier for speed/cost |
 
 Confirmation matrix:
 
@@ -304,8 +305,11 @@ old blanket "no persistence" rule for this one artifact; nothing else is ever wr
 ## 6. Usage (the shipped UX)
 
 ```bash
-# today, before anything is published — the v0 wrapper (§2.5)
+# today, before anything is published — the wrapper (§2.5)
 pi-exec "find all pdf files larger than 50MB in my home folder"
+
+# …faster & cheaper: generate with a flash tier
+pi-exec "count files in dir" --exec-model ollama/glm-5.3-flash:cloud
 
 # trial — nothing installed
 pi -e npm:pi-exec --exec "find all pdf files larger than 50MB in my home folder"
@@ -634,7 +638,7 @@ feature and keeps the extension honest with pi's "no background resources" rule.
 | **P3 — execution + UX polish** | streaming output, timeout, abort wiring, exit-code passthrough, warn-reason display in confirm | manual smoke matrix (tui confirm / print dry-run / -yes / deny refusal) |
 | **P4 — docs** | README: usage (§6), the pi credit section (§12), wrapper + extension install paths; this plan stays as docs/plan.md; CHANGELOG.md | README renders; usage commands verified by hand |
 | **P5 — release infra** | push branch → PR → CI green → merge; pipeline publishes 0.1.1 with provenance + release notes | `pi -e npm:pi-exec --exec …` works from the published package |
-| **P6 — v1.1 candidates (post-release, not blockers)** | config-file lint overrides, `--exec-model` override, Windows/powershell path, richer history (search, rerun-by-id, child-output capture) — the basic cache itself ships in v1 (§4.6) | discussed in README "Roadmap" |
+| **P6 — v1.1 candidates (post-release, not blockers)** | config-file lint overrides, Windows/powershell path, richer history (search, rerun-by-id, child-output capture) — the basic cache ships in v1 (§4.6), and `--exec-model` was pulled into v1 for speed/cost | discussed in README "Roadmap" |
 
 ---
 

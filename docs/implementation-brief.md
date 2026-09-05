@@ -54,6 +54,9 @@ Verified against `@earendil-works/pi-coding-agent` 0.85.1's actual `.d.ts` files
 | D-8 | **History cache** (plan §4.6): append-only JSONL at `~/.pi/agent/cache/pi-exec/history.jsonl`, one entry per outcome; last-3 commands injected as model reference context; `/exec-history [n]` + `--exec-history <n>` preview. Replaces plan.md's original "no persistence" rule (§4.4.5/SR4 amended). | owner request: "keep input/output history somewhere in disk cache … super lightweight" |
 | D-9 | **Print-mode terminal confirm** (plan §4.3 matrix): in print mode with a controlling terminal, the extension asks `Run this command? [y/N]` directly on `/dev/tty` (question + command text go to the tty, never stdout/stderr); declined/EOF/no-tty → 130. Dry-run default now applies ONLY when headless without a terminal (CI/pipes). Recommended no-interface one-shot: `pi -p --no-session --exec "…"`. | owner request: "I don't want to open the pi interface in --exec invocations… behind the scenes is okay" — the TUI itself cannot be suppressed by an extension (it renders before session_start), so pi is kept behind the scenes via `-p` and the confirm moves to the terminal |
 | D-10 | **Help menu** (plan FR9): `--exec-help` boolean flag + `--exec ""` (empty value, previously usage-error exit 1 → now help, exit 0) + bare `/exec` all print `EXEC_HELP_LINES`; flag forms exit 0 and never invoke the exec pipeline. (`--exec` with NO value cannot be intercepted — pi's flag parser errors before extensions load; users are told to pass an empty value.) | owner request: "we need to show help menu… help, -h, --help, -help, or empty invocations" |
+| D-11 | **Minimal reasoning for generation**: the complete call passes `reasoning: "minimal"` — command generation is trivial; auto thinking burned ~12s of reasoning tokens per call (measured: 16.5s → 4.2s total). Fixed, not a flag: one shell command never needs deep thinking. | measured on this machine (glm-5.3:cloud via ollama proxy; raw endpoint 2.7s without thinking) |
+| D-12 | **`--exec-model <provider/model-id>`** (P6 item pulled into v1): overrides the session model for generation, resolved via `ctx.modelRegistry.find(provider, id)`; unknown/malformed → usage failure exit 1. Lets users point at a flash tier (raw flash round-trip measured at ~1.5s → ~2.5s total). | owner request: "pi takes time to load… glm5.3 cloud is expensive" |
+| D-13 | **Ran-command report**: the final report line names the executed command — stderr `pi-exec: ran: <command> (exit N)`; UI notify `pi-exec: ran '<command>' (exit N)` (+ rpc tail). The transcript becomes self-describing and the command copyable from the tail of the output. | owner request: "write the command we ran" |
 
 ## 3. Architecture (plan §4.2, unchanged)
 
@@ -352,16 +355,19 @@ Constants: `WIDGET_KEY = "pi-exec"`, `WIDGET_TAIL_LINES = 15`, `NOTIFY_TAIL_LINE
 (`node:os` homedir + `node:path` join; exported for the factory).
 
 Default seams: `deps.complete ??` wraps `ctx.modelRegistry.complete` (context with
-`{ role: "user", content, timestamp: Date.now() }`, options `{ maxTokens,
-...(opts.signal ? { signal } : {}) }`) + `contentText(message.content)`; `deps.exec ??
-createSpawnExec()`.
+`{ role: "user", content, timestamp: Date.now() }`, options `{ maxTokens, reasoning:
+"minimal" (D-11), ...(opts.signal ? { signal } : {}) }`) + `contentText(message.content)`;
+`deps.exec ?? createSpawnExec()`.
+
+`RunDeps` gains `model?: Model<Api>` (pi-ai type, adapter-side): the generation model is
+`deps.model ?? ctx.model` — the factory resolves `--exec-model` into it (D-12).
 
 Flow:
 0. History wiring: `const historyPath = deps.historyPath ?? DEFAULT_HISTORY_PATH;`
    `const recent = await readHistory(historyPath)` (never throws) → `recentCommands` =
    last 3 entries with non-empty `command`, chronological → merged into the request passed
    to `planExec` (conditional spread; omit the key when empty).
-1. `ctx.model` null → headless: `process.stderr.write("pi-exec: no active model — set one
+1. Generation model: `deps.model ?? ctx.model`; null → headless: `process.stderr.write("pi-exec: no active model — set one
    with /model or a provider env\n")`; with UI: `ctx.ui.notify(same, "error")`; return `1`.
 2. `plan = await planExec(req, { complete })`.
 3. `refuse`/`error` → report reason (UI: notify `"warning"`/`"error"`; headless: stderr with
@@ -393,9 +399,11 @@ Flow:
         chunk `ctx.ui.setWidget(WIDGET_KEY, tailLines(WIDGET_TAIL_LINES))`; widget KEEPS final
         output after completion (live output is the UX). **rpc**: buffer; no widget.
    e. Buffer always (bounded tail), so rpc final notify can include the output tail.
-   f. Report exit code: UI → notify(`pi-exec: finished (exit N)`) + rpc also gets output tail
+   f. Report exit code (D-13): UI → notify(`pi-exec: ran '<command>' (exit N)`) + rpc also
+      gets output tail
       (`NOTIFY_TAIL_LINES` lines, each capped `NOTIFY_LINE_CAP` chars); print/json →
-      `process.stderr.write("pi-exec: exit N\n")`. Return the child's exit code (124 if killed).
+      `process.stderr.write("pi-exec: ran: <command> (exit N)\n")`. Return the child's exit
+      code (124 if killed).
 6. **Record** — EVERY terminal outcome (no-model, refuse, error, dry-run, declined, run)
    appends exactly one `HistoryEntry` to `historyPath`:
    `{ ts: Date.now(), text: req.text, command: <command or "">, kind, ...(warn ? { warn } : {}),
@@ -462,6 +470,11 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
     **NO `default`** (a default would fire the preview in every plain `pi` session;
     absent → undefined → skipped)
   - `exec-help` — boolean — `Print the pi-exec help menu and exit` — **NO `default`**
+  - `exec-model` — string — `Model override for generation (provider/model-id)` — **NO
+    `default`**; resolved in session_start: must contain a `/` (else usage failure exit 1,
+    message shows the `provider/model-id` format), `ctx.modelRegistry.find(provider, id)` →
+    undefined → usage failure exit 1 (message suggests `pi --list-models`); found → merged
+    into the runExec deps: `{ ...deps, ...(override ? { model: override } : {}) }` (D-12)
 - `pi.on("session_start", async (event, ctx) => { ... })`:
   - `if (event.reason !== "startup") return;` (D-5)
   - `pi.getFlag("exec-help") === true` → print `EXEC_HELP_LINES` (mode-aware: print →
@@ -563,6 +576,11 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
   the right kind and fields (exitCode only for run; warn only when lint warned); runExec
   still returns the correct exit code when historyPath points somewhere unwritable;
   recentCommands are loaded from the history file and reach the fake complete's user prompt;
+  **D-13: the final stderr line is `pi-exec: ran: <command> (exit N)` (command present, exit
+  code present); UI final notify is `pi-exec: ran '<command>' (exit N)`; D-11: the default
+  complete passes `reasoning: "minimal"` in the registry options (captured by the fake
+  modelRegistry); D-12: `deps.model` overrides `ctx.model` for the registry call and works
+  even when `ctx.model` is null**;
   **terminal confirm (D-9): `deps.prompt` called exactly when `!hasUI && canPrompt && !yes`
   (not when yes, not when hasUI, not on dry-run plans); prompt → true: exec runs, banner still
   goes to stdout after the confirm; prompt → false: no exec, declined history entry, 130;
@@ -579,7 +597,10 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
   command → notify with preview lines (limit from arg, default 10); `/exec-history` invalid
   arg → usage warning; **`--exec-help` → menu printed (print mode: stdout), exit 0, shutdown,
   exec pipeline NOT invoked; canPrompt wiring: fake `deps.ttyAvailable` true + print mode →
-  request reaches runExec with canPrompt true; false → absent**.
+  request reaches runExec with canPrompt true; false → absent; **`--exec-model ollama/x` →
+  modelRegistry.find("ollama", "x") result flows to runExec as deps.model (observable via
+  fake registry's captured model arg); unknown id → usage failure exit 1 + shutdown;
+  missing `/` → usage failure exit 1**.
 - `exec.test.ts`: vi.mock child_process (see §5.1).
 
 ## 9. Acceptance for the whole implementation
