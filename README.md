@@ -29,7 +29,13 @@ pi -e npm:pi-exec --exec "show the 10 largest directories under ~"
 ## Usage
 
 ```bash
-# one-shot, NO pi interface: propose → confirm on your terminal → stream → exit
+# the short form (wrapper: first arg is the request, rest passes through)
+pi-exec "resize all pngs in this folder to 50%"
+
+# faster & cheaper: generate with a flash tier
+pi-exec "count files in dir" --exec-model ollama/glm-5.3-flash:cloud
+
+# the same, spelled out (propose → confirm on your terminal → stream → exit)
 pi -p --no-session --exec "resize all pngs in this folder to 50%"
 
 # same, but inside the pi TUI (opens the full interface)
@@ -68,6 +74,7 @@ beyond its history cache, but pi would still write a session file for the run.
 | `--exec-timeout <sec>` | string | execution timeout in seconds (default 120) |
 | `--exec-history <n>` | string | print the last N history entries and exit |
 | `--exec-help` | boolean | print the pi-exec help menu and exit (same menu for `--exec ""` and bare `/exec`) |
+| `--exec-model <provider/model-id>` | string | model override for generation — point it at a flash tier for speed/cost; unknown → exit 1 |
 
 ### Confirmation matrix
 
@@ -81,6 +88,16 @@ The recommended no-interface one-shot is `pi -p --no-session --exec "…"`: pi s
 behind the scenes and the confirm lands directly on your terminal
 (`$ ls -la` + `Run this command? [y/N]`). Answer `n` → exit 130, nothing executed.
 Dry-run remains the default only when there is genuinely no terminal to ask (CI, pipes).
+After execution the final line names the command and its outcome —
+`pi-exec: ran: <command> (exit 0)` — so the transcript is self-describing.
+
+## Performance
+
+The wait is the model, not pi: pi's startup is ~1s; the generation call is the rest.
+pi-exec pins `reasoning: "minimal"` for generation — a shell command doesn't need thinking
+(measured on one machine, glm-5.3:cloud: 16.5s with auto thinking → 4.2s with minimal).
+Point `--exec-model` at a flash tier and the whole one-shot lands around **2s**.
+No separate "lite" runtime: it would save ≤1s and forfeit pi's provider/auth handling.
 
 ## Safety model
 
@@ -128,11 +145,14 @@ purpose:
 - `/exec-history [n]` (in-session) and `pi --exec-history <n>` preview newest-first.
 - Deleting the file resets the cache. No rotation in v1.
 
-## The v0 wrapper
+## The pi-exec wrapper
 
-`scripts/pi-exec.sh` is the verified standalone wrapper that shipped the same UX before
-the extension existed (`pi -p` under the hood, `read`-based confirm, `bash -lc` exec,
-exit-code passthrough). It stays as the reference implementation of parse + confirm.
+`scripts/pi-exec.sh` is the short, friendly face: `pi-exec "<request>" [--exec-* flags…]`
+delegates to the extension — same engine (contract, parse, lint, terminal confirm,
+security banner, history), one short command. It resolves the extension from the repo
+checkout containing the script; `PI_EXEC_EXTENSION=/path/to/index.ts` overrides for
+copies installed elsewhere, and after `pi install npm:pi-exec` the plain
+`pi -p --no-session --exec …` form works without any `-e`.
 
 ## Development
 

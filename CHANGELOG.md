@@ -37,6 +37,16 @@ Initial implementation of the pi-exec extension (design: `docs/plan.md`; verifie
   pipes); Ctrl+D ends pi cleanly with nothing executed
 - **help menu (D-10)**: `--exec-help`, `pi --exec ""` (empty value, exit 0) and bare
   `/exec` print the full usage/safety/exit-code menu
+- **performance (D-11)**: generation runs with `reasoning: "minimal"` — measured
+  16.5s → 4.2s on glm-5.3:cloud (auto thinking was the wait, not pi's ~1s startup)
+- **`--exec-model <provider/model-id>` (D-12)**: generation-model override resolved
+  via the registry (unknown/malformed → exit 1); flash tiers bring the whole one-shot
+  to ~2s
+- **ran-command report (D-13)**: the final line names the executed command and its exit
+  code — `pi-exec: ran: <command> (exit N)` — so transcripts are self-describing
+- **wrapper is now the short face**: `pi-exec "<request>" [--flags…]` delegates to the
+  extension (`pi -p --no-session --exec …`, `-e` resolved from the checkout or
+  `PI_EXEC_EXTENSION`)
 - v0 standalone wrapper `scripts/pi-exec.sh` (the verified reference implementation)
 - CI (node 20/22 matrix) and publish pipeline (patch bump, provenance, GitHub release)
 - Docs: README (usage, safety model, history, troubleshooting), AGENTS.md, this changelog

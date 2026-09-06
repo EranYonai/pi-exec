@@ -1,6 +1,7 @@
 /**
- * pi adapter for the exec pipeline: resolves the session's already-configured
- * model through `ctx.modelRegistry` (auth is pi's), executes the plan through
+ * pi adapter for the exec pipeline: resolves the generation model — the
+ * `--exec-model` override (`deps.model`, D-12) or the session's configured
+ * model through `ctx.modelRegistry` (auth is pi's) — executes the plan through
  * the exec seam, and reports by mode — print stdout stays pipeable, json
  * keeps stdout clean for pi's JSON channel, TUI gets live widgets.
  *
@@ -20,7 +21,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
-import { contentText } from "@earendil-works/pi-ai";
+import { contentText, type Api, type Model } from "@earendil-works/pi-ai";
 import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   appendHistoryEntry,
@@ -41,6 +42,8 @@ export interface RunDeps {
   complete?: CompleteFn;
   exec?: ExecFn;
   historyPath?: string;
+  /** D-12: overrides the session model for generation (resolved from --exec-model by the factory). */
+  model?: Model<Api>;
   prompt?: PromptFn;
   ttyAvailable?: () => boolean;
 }
@@ -153,6 +156,7 @@ export const EXEC_HELP_LINES: readonly string[] = [
   '  pi --exec "<request>" --exec-yes         skip the confirmation (safety lint still applies)',
   '  pi --exec "<request>" --exec-print       print the command only, never run it',
   '  pi --exec "<request>" --exec-timeout 30  execution timeout in seconds (default 120)',
+  '  pi --exec "<request>" --exec-model p/m   generate with another model (provider/model-id)',
   "  pi --exec-history <n>                    print the last n history entries and exit",
   "  pi --exec-help                           print this help menu and exit",
   '  pi --exec ""                             an empty value also prints this menu',
@@ -213,8 +217,9 @@ export async function runExec(
     .filter((command) => command !== "")
     .slice(-RECENT_COMMANDS_COUNT);
 
-  // Step 1: no active model — nothing to generate from.
-  const model = ctx.model;
+  // Step 1: generation model — the --exec-model override (D-12) wins over the
+  // session model; when both are absent there is nothing to generate from.
+  const model = deps.model ?? ctx.model;
   if (!model) {
     notify(ctx, "no active model — set one with /model or a provider env", "error");
     await record("error", "");
@@ -232,7 +237,12 @@ export async function runExec(
             messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
           },
           // exactOptionalPropertyTypes: pass signal only when defined.
-          { maxTokens: opts.maxTokens, ...(opts.signal ? { signal: opts.signal } : {}) },
+          {
+            maxTokens: opts.maxTokens,
+            // EXPERIMENT: command generation is trivial — minimal reasoning
+            reasoning: "minimal",
+            ...(opts.signal ? { signal: opts.signal } : {}),
+          },
         )
         .then((message) => contentText(message.content)));
 
@@ -378,15 +388,16 @@ export async function runExec(
   if (ctx.hasUI) {
     const tail = tailLines(buffer, NOTIFY_TAIL_LINES, NOTIFY_LINE_CAP);
     // TUI keeps the output visible in the widget; RPC has no widget, so the
-    // tail rides along in the final notify.
+    // tail rides along in the final notify. D-13: the report names the
+    // executed command so the transcript is self-describing.
     ctx.ui.notify(
       ctx.mode === "rpc" && tail.length > 0
-        ? `pi-exec: finished (exit ${result.code})\n${tail.join("\n")}`
-        : `pi-exec: finished (exit ${result.code})`,
+        ? `pi-exec: ran '${plan.command}' (exit ${result.code})\n${tail.join("\n")}`
+        : `pi-exec: ran '${plan.command}' (exit ${result.code})`,
       result.code === 0 ? "info" : "warning",
     );
   } else {
-    process.stderr.write(`pi-exec: exit ${result.code}\n`);
+    process.stderr.write(`pi-exec: ran: ${plan.command} (exit ${result.code})\n`);
   }
   await record("run", plan.command, plan.warn, result.code);
   return result.code;

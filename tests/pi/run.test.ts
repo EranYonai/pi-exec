@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   EXEC_SYSTEM_PROMPT,
@@ -315,7 +316,7 @@ describe("runExec — headless print mode (exit codes & stdout discipline)", () 
     expect(code).toBe(42);
     expect(deps.exec).toHaveBeenCalledOnce();
     expect(stdout).toEqual(["out chunk\n"]);
-    expect(stderr).toEqual(["$ ls\n", "err chunk\n", "pi-exec: exit 42\n"]);
+    expect(stderr).toEqual(["$ ls\n", "err chunk\n", "pi-exec: ran: ls (exit 42)\n"]);
   });
 
   it("killed by our signal → exit 124", async () => {
@@ -686,7 +687,7 @@ describe("runExec — D-7 security banner", () => {
       `${formatSecurityBanner("runs as root")}\n`,
       "$ sudo apt update\n",
       "child out\n",
-      "pi-exec: exit 0\n",
+      "pi-exec: ran: sudo apt update (exit 0)\n",
     ]);
   });
 
@@ -732,7 +733,7 @@ describe("runExec — streaming by mode", () => {
       });
       expect(code).toBe(3);
       expect(stdout).toEqual(["out one\n", "out two"]);
-      expect(stderr).toEqual(["$ ls\n", "err one\n", "pi-exec: exit 3\n"]);
+      expect(stderr).toEqual(["$ ls\n", "err one\n", "pi-exec: ran: ls (exit 3)\n"]);
     } finally {
       stdoutSpy.mockRestore();
       stderrSpy.mockRestore();
@@ -757,10 +758,11 @@ describe("runExec — streaming by mode", () => {
     expect(last[1]).toEqual(["line one", "warn line", "line two"]);
     // The widget is never cleared — final output stays visible.
     expect(last[1]).not.toBeUndefined();
-    const finished = ui.notify.mock.calls.find(
-      (call) => (call[0] as string).includes("finished"),
+    // D-13: the final report names the executed command.
+    const ran = ui.notify.mock.calls.find(
+      (call) => (call[0] as string).includes("pi-exec: ran"),
     ) as [string, string];
-    expect(finished[0]).toBe("pi-exec: finished (exit 0)");
+    expect(ran[0]).toBe("pi-exec: ran 'ls' (exit 0)");
   });
 
   it("rpc mode: no widget, final notify includes the output tail", async () => {
@@ -772,12 +774,12 @@ describe("runExec — streaming by mode", () => {
     const code = await runExec(ctx, makeReq(), { ...deps, historyPath: historyPath() });
     expect(code).toBe(0);
     expect(ui.setWidget).not.toHaveBeenCalled();
-    const finished = ui.notify.mock.calls.find(
-      (call) => (call[0] as string).includes("finished"),
+    const ran = ui.notify.mock.calls.find(
+      (call) => (call[0] as string).includes("pi-exec: ran"),
     ) as [string, string];
-    expect(finished[0]).toContain("pi-exec: finished (exit 0)");
-    expect(finished[0]).toContain("line a");
-    expect(finished[0]).toContain("line c");
+    expect(ran[0]).toContain("pi-exec: ran 'ls' (exit 0)");
+    expect(ran[0]).toContain("line a");
+    expect(ran[0]).toContain("line c");
   });
 
   it("rpc mode: non-zero exit notifies at warning level", async () => {
@@ -786,9 +788,9 @@ describe("runExec — streaming by mode", () => {
     const code = await runExec(ctx, makeReq(), { ...deps, historyPath: historyPath() });
     expect(code).toBe(42);
     const calls = ui.notify.mock.calls as unknown as [string, string][];
-    const finished = calls.find((call) => call[0].includes("finished"))!;
-    expect(finished[0]).toContain("pi-exec: finished (exit 42)");
-    expect(finished[1]).toBe("warning");
+    const ran = calls.find((call) => call[0].includes("pi-exec: ran"))!;
+    expect(ran[0]).toContain("pi-exec: ran 'ls' (exit 42)");
+    expect(ran[1]).toBe("warning");
   });
 
   it("rpc tail lines are capped at 200 chars and the buffer drops its front past 8000", async () => {
@@ -799,16 +801,16 @@ describe("runExec — streaming by mode", () => {
       return { code: 0, killed: false };
     });
     await runExec(ctx, makeReq(), { ...deps, historyPath: historyPath() });
-    const finished = ui.notify.mock.calls.find(
-      (call) => (call[0] as string).includes("finished"),
+    const ran = ui.notify.mock.calls.find(
+      (call) => (call[0] as string).includes("pi-exec: ran"),
     ) as unknown as [string, string];
     // The over-long first line is capped at 200 chars…
-    const tailLine = finished[0].split("\n")[1] as string;
+    const tailLine = ran[0].split("\n")[1] as string;
     expect(tailLine.length).toBe(200);
     // …the buffer's front was dropped (EARLY-CONTENT is gone)…
-    expect(finished[0]).not.toContain("EARLY-CONTENT");
+    expect(ran[0]).not.toContain("EARLY-CONTENT");
     // …and the newest content survived in the tail.
-    expect(finished[0]).toContain("LATE-MARKER");
+    expect(ran[0]).toContain("LATE-MARKER");
   });
 
   it("req.signal is composed into the signal forwarded to exec", async () => {
@@ -1014,5 +1016,118 @@ describe("runExec — history wiring", () => {
   it("DEFAULT_HISTORY_PATH points at ~/.pi/agent/cache/pi-exec/history.jsonl", () => {
     expect(DEFAULT_HISTORY_PATH.endsWith(join(".pi", "agent", "cache", "pi-exec", "history.jsonl")))
       .toBe(true);
+  });
+});
+
+describe("runExec — D-13 ran-command report", () => {
+  let stdout: string[];
+  let stderr: string[];
+  let stdoutSpy: ReturnType<typeof spyStdout>;
+  let stderrSpy: ReturnType<typeof spyStderr>;
+
+  beforeEach(() => {
+    stdout = [];
+    stderr = [];
+    stdoutSpy = spyStdout(stdout);
+    stderrSpy = spyStderr(stderr);
+  });
+
+  afterEach(() => {
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
+  });
+
+  it("headless print: the final stderr line is `pi-exec: ran: <command> (exit N)`", async () => {
+    const { ctx } = makeCtx({ mode: "print", hasUI: false });
+    const deps = makeDeps("echo hello world", async () => ({ code: 7, killed: false }));
+    const code = await runExec(ctx, makeReq({ hasUI: false, yes: true }), {
+      ...deps,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(7);
+    expect(stderr.at(-1)).toBe("pi-exec: ran: echo hello world (exit 7)\n");
+  });
+
+  it("tui: the final notify is `pi-exec: ran '<command>' (exit N)`", async () => {
+    const { ctx, ui } = makeCtx({ mode: "tui", hasUI: true });
+    const deps = makeDeps("echo hello world", async () => ({ code: 3, killed: false }));
+    const code = await runExec(ctx, makeReq(), { ...deps, historyPath: historyPath() });
+    expect(code).toBe(3);
+    const ran = ui.notify.mock.calls.find(
+      (call) => (call[0] as string).includes("pi-exec: ran"),
+    ) as [string, string];
+    expect(ran[0]).toBe("pi-exec: ran 'echo hello world' (exit 3)");
+    expect(ran[1]).toBe("warning");
+  });
+
+  it("tui: a clean run reports the command at info level", async () => {
+    const { ctx, ui } = makeCtx({ mode: "tui", hasUI: true });
+    const deps = makeDeps("ls -la");
+    const code = await runExec(ctx, makeReq(), { ...deps, historyPath: historyPath() });
+    expect(code).toBe(0);
+    const ran = ui.notify.mock.calls.find(
+      (call) => (call[0] as string).includes("pi-exec: ran"),
+    ) as [string, string];
+    expect(ran[0]).toBe("pi-exec: ran 'ls -la' (exit 0)");
+    expect(ran[1]).toBe("info");
+  });
+});
+
+describe("runExec — D-11/D-12 model selection (registry path)", () => {
+  function assistantMessage(text: string): unknown {
+    return {
+      role: "assistant",
+      content: [{ type: "text", text }],
+      api: "openai-completions",
+      provider: "test",
+      model: "test-model",
+    };
+  }
+
+  it("D-11: the default complete passes reasoning minimal in the registry options", async () => {
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({ mode: "print", hasUI: false, registryComplete });
+    const code = await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    expect(registryComplete).toHaveBeenCalledOnce();
+    const options = (registryComplete.mock.calls[0] as unknown as unknown[] | undefined)?.[2] as {
+      maxTokens: number;
+      reasoning?: string;
+      signal?: AbortSignal;
+    };
+    expect(options.reasoning).toBe("minimal");
+    expect(options.maxTokens).toBe(300);
+  });
+
+  it("D-12: deps.model overrides ctx.model in the registry call", async () => {
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({ mode: "print", hasUI: false, registryComplete });
+    const override = { provider: "ollama", id: "glm-5.3-flash:cloud" } as unknown as Model<Api>;
+    const code = await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+      model: override,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    expect(registryComplete).toHaveBeenCalledOnce();
+    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+    // The override object itself — not the session model — reaches the registry.
+    expect(modelArg).toBe(override);
+    expect(modelArg).not.toEqual({ provider: "test", id: "test-model" });
+  });
+
+  it("D-12: deps.model alone is enough when ctx.model is null", async () => {
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({ mode: "print", hasUI: false, model: null, registryComplete });
+    const override = { provider: "test", id: "override-model" } as unknown as Model<Api>;
+    const code = await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+      model: override,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    expect(registryComplete).toHaveBeenCalledOnce();
+    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+    expect(modelArg).toBe(override);
   });
 });

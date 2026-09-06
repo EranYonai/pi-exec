@@ -7,6 +7,7 @@
  * them readable after startup); the factory itself only registers things.
  */
 
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_TIMEOUT_SEC,
@@ -65,6 +66,12 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
   pi.registerFlag("exec-help", {
     description: "Print the pi-exec help menu and exit",
     type: "boolean",
+  });
+  // D-12: no default — an override must be explicit; resolved against
+  // ctx.modelRegistry in session_start (registries are only ready there).
+  pi.registerFlag("exec-model", {
+    description: "Model override for generation (provider/model-id)",
+    type: "string",
   });
 
   pi.on("session_start", async (event, ctx) => {
@@ -126,6 +133,39 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
       return;
     }
 
+    // D-12: --exec-model <provider/model-id> overrides the session model for
+    // generation. Split on the FIRST "/" only — model ids may contain colons.
+    const modelOverride = pi.getFlag("exec-model");
+    let model: Model<Api> | undefined;
+    if (typeof modelOverride === "string" && modelOverride !== "") {
+      const slash = modelOverride.indexOf("/");
+      if (slash === -1) {
+        notify(
+          ctx,
+          "usage: --exec-model <provider/model-id> (e.g. ollama/glm-5.3-flash:cloud)",
+          "warning",
+        );
+        setExitCode(ctx.mode, 1);
+        await ctx.shutdown();
+        return;
+      }
+      const resolved = ctx.modelRegistry.find(
+        modelOverride.slice(0, slash),
+        modelOverride.slice(slash + 1),
+      );
+      if (!resolved) {
+        notify(
+          ctx,
+          `--exec-model ${modelOverride}: unknown model — run "pi --list-models" to list available models`,
+          "warning",
+        );
+        setExitCode(ctx.mode, 1);
+        await ctx.shutdown();
+        return;
+      }
+      model = resolved;
+    }
+
     const req: ExecRequest = {
       text,
       cwd: ctx.cwd,
@@ -141,7 +181,7 @@ export default function piExec(pi: ExtensionAPI, deps: RunDeps = {}): void {
       // exactOptionalPropertyTypes: forward only when defined.
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     };
-    const code = await runExec(ctx, req, deps);
+    const code = await runExec(ctx, req, { ...deps, ...(model ? { model } : {}) });
     setExitCode(ctx.mode, code);
     await ctx.shutdown(); // one-shot: done means done
   });
