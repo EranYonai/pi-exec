@@ -25,8 +25,9 @@ LLM completion plus one child process. That is the whole product.
 
 - Not a general agent (`pi` already is one). If the request needs multi-step reasoning or
   file edits, pi-exec should say so instead of improvising.
-- No new API keys, no own model configuration — it reuses the session model and pi's auth
-  (the codebase-memory lesson recorded in pi-weave: resolve the session model through
+- No new API keys, no own model configuration — generation defaults to a cheap flash-class
+  model (D-14, `$PI_EXEC_MODEL` to override) and reuses pi's auth
+  (the codebase-memory lesson recorded in pi-weave: resolve models through
   `ctx.modelRegistry`, which owns auth).
 - No background resources, no UI surfaces beyond confirm/notify. The only disk artifact is
   the lightweight history cache (§4.6) — no config, no session data.
@@ -67,6 +68,9 @@ confirm, banner, history), the script is just the short launcher:
 pi-exec "find all pdf files larger than 50MB in my home folder"
 pi-exec "count files in dir" --exec-model ollama/glm-5.3-flash:cloud
 ```
+
+Generation defaults to a cheap flash-class model (`$PI_EXEC_MODEL` to override, D-14 in the
+implementation brief) — `--exec-model` stays the per-run override.
 
 Contract: first argument is the request (quote it), remaining arguments pass through to
 pi (`--exec-yes`, `--exec-print`, `--exec-model`, …). Equivalent to
@@ -122,9 +126,11 @@ pi --exec "…prompt…"
   └─ session_start(reason) ── flag present? ── no ──► extension is a no-op for the session
                                         │ yes
                                         ▼
-        1. resolve model     ctx.model? — null → notify + shutdown(exit 1)
-        2. generate          modelRegistry.complete(model — session default or --exec-model
-                              override, CONTRACT_PROMPT + user text,
+        1. resolve model     deps.model (--exec-model, D-12) ? resolveDefaultModel (D-14:
+                             $PI_EXEC_MODEL else the built-in flash default) ? ctx.model;
+                             null everywhere → notify + shutdown(exit 1)
+        2. generate          modelRegistry.complete(model — cheap flash default unless overridden,
+                              CONTRACT_PROMPT + user text,
                               { maxTokens: 300, reasoning: "minimal", signal })   [ONE completion, no tools]
         3. parse             strip code fences/quotes/whitespace; reject >1 command line,
                             refuse "I can't" chatter → show raw + exit
@@ -181,7 +187,7 @@ network or spawn a real shell.
 | `--exec-timeout <sec>` | number | execution timeout, default 120 |
 | `--exec-history <n>` | string | print the last N cache entries (newest first) and exit; `/exec-history [n]` is the in-session form |
 | `--exec-help` | boolean | print the pi-exec help menu and exit (same menu for `--exec ""` and bare `/exec`) |
-| `--exec-model <provider/model-id>` | string | model override for generation (resolve via the registry; unknown → exit 1). Point it at a flash tier for speed/cost |
+| `--exec-model <provider/model-id>` | string | model override for generation (resolve via the registry; unknown → exit 1). Point it at a flash tier for speed/cost. Default without it: `$PI_EXEC_MODEL`, else `ollama/deepseek-v4-flash:cloud` (D-14); the session model is only the fallback |
 
 Confirmation matrix:
 

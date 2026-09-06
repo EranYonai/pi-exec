@@ -13,23 +13,36 @@ import {
 } from "../../src/core";
 import type { ExecOptions, ExecResult } from "../../src/pi/exec";
 import { DEFAULT_HISTORY_PATH, formatSecurityBanner, runExec } from "../../src/pi/run";
-import type { RunDeps } from "../../src/pi/run";
+import {
+  DEFAULT_EXEC_MODEL,
+  EXEC_MODEL_ENV,
+  resolveDefaultModel,
+  type RunDeps,
+} from "../../src/pi/run";
 
-// The terminalConfirm fallback must never open a real /dev/tty: node:fs and
-// node:readline/promises are fully mocked (history uses node:fs/promises — a
-// different specifier, left untouched).
+// The terminalConfirm fallback must never open a real /dev/tty: node:fs,
+// node:tty, and node:readline/promises are fully mocked (history uses
+// node:fs/promises — a different specifier, left untouched).
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
     accessSync: vi.fn(),
+    openSync: vi.fn(() => {
+      throw new Error("no real /dev/tty in tests");
+    }),
     createReadStream: vi.fn(),
     createWriteStream: vi.fn(),
   };
 });
+vi.mock("node:tty", () => ({
+  ReadStream: vi.fn(),
+  WriteStream: vi.fn(),
+}));
 vi.mock("node:readline/promises", () => ({ createInterface: vi.fn() }));
 
-import { createReadStream, createWriteStream } from "node:fs";
+import { openSync } from "node:fs";
+import { ReadStream, WriteStream } from "node:tty";
 import { createInterface } from "node:readline/promises";
 
 let dir: string;
@@ -76,6 +89,8 @@ interface CtxOverrides {
   model?: { provider: string; id: string } | null;
   /** Replace the throwing registry stub with a working fake. */
   registryComplete?: (model: unknown, context: unknown, options: unknown) => Promise<unknown>;
+  /** D-14 tests: registry find spy — omitted → no find on the fake (defensive path). */
+  registryFind?: (provider: string, id: string) => unknown;
 }
 
 function makeCtx(overrides: CtxOverrides = {}) {
@@ -98,6 +113,8 @@ function makeCtx(overrides: CtxOverrides = {}) {
         vi.fn(async () => {
           throw new Error("registry must not be used when deps.complete is injected");
         }),
+      // exactOptionalPropertyTypes: add find only when the test provides one.
+      ...(overrides.registryFind ? { find: overrides.registryFind } : {}),
     },
     signal: overrides.signal,
     shutdown: vi.fn(),
@@ -572,6 +589,14 @@ describe("runExec — D-9 terminal confirm (print mode, /dev/tty)", () => {
   it("without deps.prompt, falls back to the built-in terminalConfirm on /dev/tty", async () => {
     const rl = makeRl("n");
     mockRl(rl);
+    // Open the tty seam: two fds, two benign tty streams.
+    vi.mocked(openSync).mockImplementationOnce(() => 11).mockImplementationOnce(() => 12);
+    vi.mocked(ReadStream).mockImplementationOnce(
+      () => ({ on: vi.fn(), destroy: vi.fn() }) as never,
+    );
+    vi.mocked(WriteStream).mockImplementationOnce(
+      () => ({ on: vi.fn(), destroy: vi.fn() }) as never,
+    );
     const { ctx } = makeCtx({ mode: "print", hasUI: false });
     const deps = makeDeps("ls -la");
     const code = await runExec(ctx, makeReq({ hasUI: false, canPrompt: true }), {
@@ -580,8 +605,10 @@ describe("runExec — D-9 terminal confirm (print mode, /dev/tty)", () => {
     });
     expect(code).toBe(130);
     expect(deps.exec).not.toHaveBeenCalled();
-    expect(createReadStream).toHaveBeenCalledWith("/dev/tty");
-    expect(createWriteStream).toHaveBeenCalledWith("/dev/tty");
+    expect(openSync).toHaveBeenCalledWith("/dev/tty", "r");
+    expect(openSync).toHaveBeenCalledWith("/dev/tty", "w");
+    expect(ReadStream).toHaveBeenCalledWith(11);
+    expect(WriteStream).toHaveBeenCalledWith(12);
     expect(rl.question).toHaveBeenCalledWith("$ ls -la\nRun this command? [y/N] ");
     expect(rl.close).toHaveBeenCalled();
   });
@@ -589,6 +616,13 @@ describe("runExec — D-9 terminal confirm (print mode, /dev/tty)", () => {
   it("built-in terminalConfirm EOF/close before an answer also declines", async () => {
     const rl = makeRl("", true);
     mockRl(rl);
+    vi.mocked(openSync).mockImplementationOnce(() => 11).mockImplementationOnce(() => 12);
+    vi.mocked(ReadStream).mockImplementationOnce(
+      () => ({ on: vi.fn(), destroy: vi.fn() }) as never,
+    );
+    vi.mocked(WriteStream).mockImplementationOnce(
+      () => ({ on: vi.fn(), destroy: vi.fn() }) as never,
+    );
     const { ctx } = makeCtx({ mode: "print", hasUI: false });
     const deps = makeDeps("ls -la");
     const code = await runExec(ctx, makeReq({ hasUI: false, canPrompt: true }), {
@@ -1129,5 +1163,212 @@ describe("runExec — D-11/D-12 model selection (registry path)", () => {
     expect(registryComplete).toHaveBeenCalledOnce();
     const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
     expect(modelArg).toBe(override);
+  });
+});
+
+describe("runExec — default generation model (D-14)", () => {
+  let previousEnv: string | undefined;
+
+  beforeEach(() => {
+    previousEnv = process.env[EXEC_MODEL_ENV];
+    delete process.env[EXEC_MODEL_ENV];
+  });
+
+  afterEach(() => {
+    if (previousEnv === undefined) delete process.env[EXEC_MODEL_ENV];
+    else process.env[EXEC_MODEL_ENV] = previousEnv;
+  });
+
+  function modelSentinel(id: string): Model<Api> {
+    return { provider: "ollama", id } as unknown as Model<Api>;
+  }
+
+  function assistantMessage(text: string): unknown {
+    return {
+      role: "assistant",
+      content: [{ type: "text", text }],
+      api: "openai-completions",
+      provider: "ollama",
+      model: "flash",
+    };
+  }
+
+  it("env unset → the built-in cheap default (deepseek-v4-flash) is resolved and used", async () => {
+    const sentinel = modelSentinel(DEFAULT_EXEC_MODEL.id);
+    const find = vi.fn(() => sentinel);
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({ mode: "print", hasUI: false, registryFind: find, registryComplete });
+    const deps = makeDeps("ls", async () => ({ code: 0, killed: false }));
+    const code = await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+      exec: deps.exec,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    expect(find).toHaveBeenCalledWith(DEFAULT_EXEC_MODEL.provider, DEFAULT_EXEC_MODEL.id);
+    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+    // The flash default — not the session model — reaches the registry.
+    expect(modelArg).toBe(sentinel);
+  });
+
+  it("env set + resolvable → the env model wins over the built-in default", async () => {
+    const envModel = modelSentinel("glm-5.3-flash:cloud");
+    const defaultModel = modelSentinel(DEFAULT_EXEC_MODEL.id);
+    const find = vi.fn((provider: string, id: string) =>
+      id === "glm-5.3-flash:cloud" ? envModel : defaultModel,
+    );
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({ mode: "print", hasUI: false, registryFind: find, registryComplete });
+    process.env[EXEC_MODEL_ENV] = "ollama/glm-5.3-flash:cloud";
+    const deps = makeDeps("ls", async () => ({ code: 0, killed: false }));
+    await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+      exec: deps.exec,
+      historyPath: historyPath(),
+    });
+    expect(find).toHaveBeenCalledWith("ollama", "glm-5.3-flash:cloud");
+    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+    expect(modelArg).toBe(envModel);
+  });
+
+  it("env set but unknown → warns and falls through to the built-in default", async () => {
+    const sentinel = modelSentinel(DEFAULT_EXEC_MODEL.id);
+    const find = vi.fn((_provider: string, id: string) =>
+      id === DEFAULT_EXEC_MODEL.id ? sentinel : undefined,
+    );
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx, ui } = makeCtx({
+      mode: "print",
+      hasUI: false,
+      registryFind: find,
+      registryComplete,
+    });
+    process.env[EXEC_MODEL_ENV] = "ollama/nope";
+    const stderr: string[] = [];
+    const stderrSpy = spyStderr(stderr);
+    const deps = makeDeps("ls", async () => ({ code: 0, killed: false }));
+    try {
+      const code = await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+        exec: deps.exec,
+        historyPath: historyPath(),
+      });
+      expect(code).toBe(0);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    expect(stderr.join("")).toContain("PI_EXEC_MODEL ollama/nope: unknown model");
+    expect(ui.notify).not.toHaveBeenCalled();
+    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+    expect(modelArg).toBe(sentinel);
+  });
+
+  it("env without a provider → usage warning, built-in default still used", async () => {
+    const sentinel = modelSentinel(DEFAULT_EXEC_MODEL.id);
+    const find = vi.fn(() => sentinel);
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({ mode: "print", hasUI: false, registryFind: find, registryComplete });
+    process.env[EXEC_MODEL_ENV] = "just-an-id";
+    const stderr: string[] = [];
+    const stderrSpy = spyStderr(stderr);
+    const deps = makeDeps("ls", async () => ({ code: 0, killed: false }));
+    try {
+      await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+        exec: deps.exec,
+        historyPath: historyPath(),
+      });
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    expect(stderr.join("")).toContain("usage: PI_EXEC_MODEL=<provider/model-id>");
+    // The malformed env value never reaches find as a provider.
+    expect(find).not.toHaveBeenCalledWith("just-an-id", expect.anything());
+    expect(find).toHaveBeenCalledWith(DEFAULT_EXEC_MODEL.provider, DEFAULT_EXEC_MODEL.id);
+  });
+
+  it("D-12 beats D-14: deps.model (the --exec-model flag) wins over a resolvable env", async () => {
+    const flagModel = modelSentinel("flag-model:cloud");
+    const find = vi.fn(() => modelSentinel("env-model:cloud"));
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({ mode: "print", hasUI: false, registryFind: find, registryComplete });
+    process.env[EXEC_MODEL_ENV] = "ollama/env-model:cloud";
+    const deps = makeDeps("ls", async () => ({ code: 0, killed: false }));
+    await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+      model: flagModel,
+      exec: deps.exec,
+      historyPath: historyPath(),
+    });
+    expect(find).not.toHaveBeenCalled();
+    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+    expect(modelArg).toBe(flagModel);
+  });
+
+  it("nothing resolves (find undefined everywhere) → ctx.model is the fallback", async () => {
+    const find = vi.fn(() => undefined);
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({ mode: "print", hasUI: false, registryFind: find, registryComplete });
+    const deps = makeDeps("ls", async () => ({ code: 0, killed: false }));
+    await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+      exec: deps.exec,
+      historyPath: historyPath(),
+    });
+    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+    expect(modelArg).toEqual({ provider: "test", id: "test-model" });
+  });
+
+  it("a throwing registry find is swallowed → ctx.model fallback, no throw", async () => {
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({
+      mode: "print",
+      hasUI: false,
+      registryFind: () => {
+        throw new Error("registry hiccup");
+      },
+      registryComplete,
+    });
+    const deps = makeDeps("ls", async () => ({ code: 0, killed: false }));
+    const code = await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+      exec: deps.exec,
+      historyPath: historyPath(),
+    });
+    expect(code).toBe(0);
+    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+    expect(modelArg).toEqual({ provider: "test", id: "test-model" });
+  });
+
+  it("nothing resolves and ctx.model is null → the no-active-model error stands", async () => {
+    const find = vi.fn(() => undefined);
+    const registryComplete = vi.fn(async () => assistantMessage("ls -la\n"));
+    const { ctx } = makeCtx({
+      mode: "print",
+      hasUI: false,
+      model: null,
+      registryFind: find,
+      registryComplete,
+    });
+    const deps = makeDeps("ls", async () => ({ code: 0, killed: false }));
+    const stderr: string[] = [];
+    const stderrSpy = spyStderr(stderr);
+    try {
+      const code = await runExec(ctx, makeReq({ hasUI: false, printOnly: true }), {
+        exec: deps.exec,
+        historyPath: historyPath(),
+      });
+      expect(code).toBe(1);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    expect(registryComplete).not.toHaveBeenCalled();
+    expect(stderr.join("")).toContain("no active model");
+  });
+
+  it("resolveDefaultModel returns the built-in default directly when nothing else applies", () => {
+    const sentinel = modelSentinel(DEFAULT_EXEC_MODEL.id);
+    const { ctx } = makeCtx({
+      mode: "print",
+      hasUI: false,
+      registryFind: (_provider: string, id: string) => (id === DEFAULT_EXEC_MODEL.id ? sentinel : undefined),
+    });
+    expect(resolveDefaultModel(ctx)).toBe(sentinel);
+    // Whitespace-only env values count as unset.
+    process.env[EXEC_MODEL_ENV] = "   ";
+    expect(resolveDefaultModel(ctx)).toBe(sentinel);
   });
 });

@@ -1,26 +1,32 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// NEVER open a real /dev/tty in tests: node:fs and node:readline/promises are
-// fully mocked (history.ts uses node:fs/promises — a different specifier,
-// left untouched so its real tmpdir behavior is preserved).
+// NEVER open a real /dev/tty in tests: node:fs (openSync/accessSync) and
+// node:tty are fully mocked, and node:readline/promises is mocked too
+// (history.ts uses node:fs/promises — a different specifier, left untouched
+// so its real tmpdir behavior is preserved).
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
     accessSync: vi.fn(),
-    createReadStream: vi.fn(),
-    createWriteStream: vi.fn(),
+    openSync: vi.fn(),
   };
 });
+vi.mock("node:tty", () => ({
+  ReadStream: vi.fn(),
+  WriteStream: vi.fn(),
+}));
 vi.mock("node:readline/promises", () => ({ createInterface: vi.fn() }));
 
-import { accessSync, constants, createReadStream, createWriteStream, type ReadStream, type WriteStream } from "node:fs";
+import { accessSync, constants, openSync } from "node:fs";
+import { ReadStream, WriteStream } from "node:tty";
 import { createInterface } from "node:readline/promises";
 import { EXEC_HELP_LINES, terminalConfirm, ttyAvailable } from "../../src/pi/run";
 
 const accessSyncMock = vi.mocked(accessSync);
-const createReadStreamMock = vi.mocked(createReadStream);
-const createWriteStreamMock = vi.mocked(createWriteStream);
+const openSyncMock = vi.mocked(openSync);
+const ttyReadStreamMock = vi.mocked(ReadStream);
+const ttyWriteStreamMock = vi.mocked(WriteStream);
 const createInterfaceMock = vi.mocked(createInterface);
 
 interface FakeRl {
@@ -39,17 +45,30 @@ function makeRl(answer: string, reject = false): FakeRl {
   };
 }
 
+/** Minimal tty stream fake: 'error' listener attachment + destroy. */
+function makeFakeStream(): { on: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> } {
+  return { on: vi.fn(), destroy: vi.fn() };
+}
+
 function mockRl(rl: FakeRl): void {
   createInterfaceMock.mockReturnValue(rl as unknown as ReturnType<typeof createInterface>);
 }
 
 beforeEach(() => {
-  // mockReset (not just clear): implementations like a throwing
-  // createReadStream must not leak between tests.
+  // mockReset (not just clear): implementations like a throwing openSync
+  // must not leak between tests.
   accessSyncMock.mockReset();
-  createReadStreamMock.mockReset();
-  createWriteStreamMock.mockReset();
+  openSyncMock.mockReset();
+  ttyReadStreamMock.mockReset();
+  ttyWriteStreamMock.mockReset();
   createInterfaceMock.mockReset();
+  // Defaults: two distinct fds (r then w) and benign fake streams — tests
+  // override what they need to observe.
+  openSyncMock.mockImplementation(
+    ((_path: string, flags: string | number) => (String(flags).includes("r") ? 11 : 12)) as typeof openSync,
+  );
+  ttyReadStreamMock.mockImplementation(() => makeFakeStream() as never);
+  ttyWriteStreamMock.mockImplementation(() => makeFakeStream() as never);
 });
 
 describe("ttyAvailable (D-9)", () => {
@@ -76,12 +95,14 @@ describe("ttyAvailable (D-9)", () => {
 });
 
 describe("terminalConfirm (D-9)", () => {
-  it("opens /dev/tty read+write and closes the interface afterwards", async () => {
+  it("opens /dev/tty via node:tty streams (r + w fds) and closes the interface afterwards", async () => {
     const rl = makeRl("y");
     mockRl(rl);
     await expect(terminalConfirm("ls -la")).resolves.toBe(true);
-    expect(createReadStreamMock).toHaveBeenCalledWith("/dev/tty");
-    expect(createWriteStreamMock).toHaveBeenCalledWith("/dev/tty");
+    expect(openSyncMock).toHaveBeenCalledWith("/dev/tty", "r");
+    expect(openSyncMock).toHaveBeenCalledWith("/dev/tty", "w");
+    expect(ttyReadStreamMock).toHaveBeenCalledWith(11);
+    expect(ttyWriteStreamMock).toHaveBeenCalledWith(12);
     expect(createInterfaceMock).toHaveBeenCalledOnce();
     expect(rl.close).toHaveBeenCalledOnce();
   });
@@ -111,8 +132,8 @@ describe("terminalConfirm (D-9)", () => {
     expect(rl.close).toHaveBeenCalledOnce();
   });
 
-  it("stream creation throwing (no tty) declines without ever reaching readline", async () => {
-    createReadStreamMock.mockImplementation(() => {
+  it("tty open throwing (no tty) declines without ever reaching readline", async () => {
+    openSyncMock.mockImplementation(() => {
       throw new Error("no tty available");
     });
     const rl = makeRl("y");
@@ -122,14 +143,18 @@ describe("terminalConfirm (D-9)", () => {
     expect(rl.close).not.toHaveBeenCalled();
   });
 
-  it("attaches 'error' listeners to the tty streams and the interface (ENXIO regression)", async () => {
-    // accessSync can pass while the async open fails (ENXIO without a
-    // controlling terminal) — the streams' 'error' events must be listened
-    // to, or Node crashes with an unhandled 'error' event.
+  it("attaches 'error' listeners to the tty streams and the interface (stream-death regression)", async () => {
+    // The synchronous open can succeed while the streams die later (EOF,
+    // device errors) — the streams' 'error' events must be listened to, or
+    // Node crashes with an unhandled 'error' event.
     const onInput = vi.fn();
     const onOutput = vi.fn();
-    createReadStreamMock.mockReturnValue({ on: onInput, destroy: vi.fn() } as unknown as ReadStream);
-    createWriteStreamMock.mockReturnValue({ on: onOutput, destroy: vi.fn() } as unknown as WriteStream);
+    ttyReadStreamMock.mockImplementation(
+      () => ({ on: onInput, destroy: vi.fn() }) as never,
+    );
+    ttyWriteStreamMock.mockImplementation(
+      () => ({ on: onOutput, destroy: vi.fn() }) as never,
+    );
     const rl = makeRl("y");
     mockRl(rl);
     await expect(terminalConfirm("ls -la")).resolves.toBe(true);
@@ -138,20 +163,20 @@ describe("terminalConfirm (D-9)", () => {
     expect(rl.on).toHaveBeenCalledWith("error", expect.any(Function));
   });
 
-  it("an async stream 'error' (ENXIO-style open failure) declines instead of crashing", async () => {
+  it("a stream 'error' after the open (EOF/device failure) declines instead of crashing", async () => {
     let failStream: ((err: unknown) => void) | undefined;
-    createReadStreamMock.mockReturnValue({
+    ttyReadStreamMock.mockImplementation(() => ({
       on: vi.fn((event: string, listener: (err: unknown) => void) => {
         if (event === "error") failStream = listener;
       }),
       destroy: vi.fn(),
-    } as unknown as ReadStream);
+    }) as never);
     const rl = {
       on: vi.fn(),
       question: vi.fn(
         (_q: string) =>
           new Promise<string>((_resolve, reject) => {
-            // The interface never answers: the open failed, the stream died.
+            // The interface never answers: the stream died mid-question.
             queueMicrotask(() => reject(new Error("readline was closed")));
           }),
       ),
@@ -159,7 +184,7 @@ describe("terminalConfirm (D-9)", () => {
     };
     mockRl(rl as unknown as FakeRl);
     const pending = terminalConfirm("ls -la");
-    // The async open failure arrives while the question is still pending.
+    // The stream failure arrives while the question is still pending.
     queueMicrotask(() =>
       failStream?.(Object.assign(new Error("open '/dev/tty' failed"), { code: "ENXIO" })),
     );

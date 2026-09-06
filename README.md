@@ -74,7 +74,7 @@ beyond its history cache, but pi would still write a session file for the run.
 | `--exec-timeout <sec>` | string | execution timeout in seconds (default 120) |
 | `--exec-history <n>` | string | print the last N history entries and exit |
 | `--exec-help` | boolean | print the pi-exec help menu and exit (same menu for `--exec ""` and bare `/exec`) |
-| `--exec-model <provider/model-id>` | string | model override for generation — point it at a flash tier for speed/cost; unknown → exit 1 |
+| `--exec-model <provider/model-id>` | string | model override for generation — point it at a flash tier for speed/cost; unknown → exit 1. Without it: `$PI_EXEC_MODEL`, else the built-in cheap default `ollama/deepseek-v4-flash:cloud` (the session model is only the fallback) |
 
 ### Confirmation matrix
 
@@ -96,7 +96,9 @@ After execution the final line names the command and its outcome —
 The wait is the model, not pi: pi's startup is ~1s; the generation call is the rest.
 pi-exec pins `reasoning: "minimal"` for generation — a shell command doesn't need thinking
 (measured on one machine, glm-5.3:cloud: 16.5s with auto thinking → 4.2s with minimal).
-Point `--exec-model` at a flash tier and the whole one-shot lands around **2s**.
+Generation defaults to the cheap flash model `ollama/deepseek-v4-flash:cloud` (set
+`$PI_EXEC_MODEL` to a different `provider/model-id` to change that machine-wide), so the
+whole one-shot lands around **2s** without touching `--exec-model`.
 No separate "lite" runtime: it would save ≤1s and forfeit pi's provider/auth handling.
 
 ## Safety model

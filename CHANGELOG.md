@@ -44,10 +44,27 @@ Initial implementation of the pi-exec extension (design: `docs/plan.md`; verifie
   to ~2s
 - **ran-command report (D-13)**: the final line names the executed command and its exit
   code — `pi-exec: ran: <command> (exit N)` — so transcripts are self-describing
+- **cheap default model (D-14)**: generation defaults to the flash-class
+  `ollama/deepseek-v4-flash:cloud` instead of the (often expensive) session model —
+  pi has no separate "cheap model" setting, so the default is built-in with two escape
+  hatches: `$PI_EXEC_MODEL=provider/model-id` (machine config; unknown/malformed →
+  warning + fall through) and `--exec-model` (per-run, unchanged). The session model
+  is only the final fallback; resolution never breaks an exec
 - **wrapper is now the short face**: `pi-exec "<request>" [--flags…]` delegates to the
   extension (`pi -p --no-session --exec …`, `-e` resolved from the checkout or
   `PI_EXEC_EXTENSION`)
 - v0 standalone wrapper `scripts/pi-exec.sh` (the verified reference implementation)
+
+### Fixed
+
+- **process refused to exit after the /dev/tty confirm**: the confirm's
+  `fs.createReadStream("/dev/tty")` blocks in libuv's threadpool on an uncancellable
+  `read(2)` — `destroy()` could not reap it, so pi stayed alive after the final
+  report and the terminal came back only after an extra Enter (observed on both the
+  decline and confirm paths; `--exec-yes` runs were unaffected). The streams are now
+  `node:tty` ReadStream/WriteStream on two `openSync` fds — event-driven, cleanly
+  destroyable; verified in a pty: decline → exit 130, confirm → exit 0, both
+  immediately
 - CI (node 20/22 matrix) and publish pipeline (patch bump, provenance, GitHub release)
 - Docs: README (usage, safety model, history, troubleshooting), AGENTS.md, this changelog
 

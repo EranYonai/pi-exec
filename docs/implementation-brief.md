@@ -57,6 +57,7 @@ Verified against `@earendil-works/pi-coding-agent` 0.85.1's actual `.d.ts` files
 | D-11 | **Minimal reasoning for generation**: the complete call passes `reasoning: "minimal"` — command generation is trivial; auto thinking burned ~12s of reasoning tokens per call (measured: 16.5s → 4.2s total). Fixed, not a flag: one shell command never needs deep thinking. | measured on this machine (glm-5.3:cloud via ollama proxy; raw endpoint 2.7s without thinking) |
 | D-12 | **`--exec-model <provider/model-id>`** (P6 item pulled into v1): overrides the session model for generation, resolved via `ctx.modelRegistry.find(provider, id)`; unknown/malformed → usage failure exit 1. Lets users point at a flash tier (raw flash round-trip measured at ~1.5s → ~2.5s total). | owner request: "pi takes time to load… glm5.3 cloud is expensive" |
 | D-13 | **Ran-command report**: the final report line names the executed command — stderr `pi-exec: ran: <command> (exit N)`; UI notify `pi-exec: ran '<command>' (exit N)` (+ rpc tail). The transcript becomes self-describing and the command copyable from the tail of the output. | owner request: "write the command we ran" |
+| D-14 | **Cheap default generation model**: pi has no "cheap model" concept (settings.json holds a single `defaultModel`), so the default is a hardcoded flash-class model — `ollama/deepseek-v4-flash:cloud` — with two escape hatches: `$PI_EXEC_MODEL` (machine config, `provider/model-id`) and `--exec-model` (per-run). Resolution order in `resolveDefaultModel` (run.ts, used by both `--exec` and `/exec`): `deps.model` (D-12 flag) → `$PI_EXEC_MODEL` (set-but-unknown/malformed → warn + fall through) → built-in default → `ctx.model` as the final fallback; a throwing/missing registry find is swallowed. Unresolvable everywhere keeps the existing "no active model" error. | owner request: "default to the system default 'cheap' model… maybe just hardcode deepseek4 flash if it is too hard" — pi's only model default is the (expensive) session model |
 
 ## 3. Architecture (plan §4.2, unchanged)
 
@@ -360,14 +361,17 @@ Default seams: `deps.complete ??` wraps `ctx.modelRegistry.complete` (context wi
 `deps.exec ?? createSpawnExec()`.
 
 `RunDeps` gains `model?: Model<Api>` (pi-ai type, adapter-side): the generation model is
-`deps.model ?? ctx.model` — the factory resolves `--exec-model` into it (D-12).
+`deps.model ?? resolveDefaultModel(ctx) ?? ctx.model` — the factory resolves `--exec-model`
+into `deps.model` (D-12); `resolveDefaultModel` (D-14) is `$PI_EXEC_MODEL`, else the built-in
+flash default, else `undefined` (→ `ctx.model`).
 
 Flow:
 0. History wiring: `const historyPath = deps.historyPath ?? DEFAULT_HISTORY_PATH;`
    `const recent = await readHistory(historyPath)` (never throws) → `recentCommands` =
    last 3 entries with non-empty `command`, chronological → merged into the request passed
    to `planExec` (conditional spread; omit the key when empty).
-1. Generation model: `deps.model ?? ctx.model`; null → headless: `process.stderr.write("pi-exec: no active model — set one
+1. Generation model: `deps.model ?? resolveDefaultModel(ctx) ?? ctx.model` (D-12 override,
+   D-14 cheap default, session model as the last resort); null → headless: `process.stderr.write("pi-exec: no active model — set one
    with /model or a provider env\n")`; with UI: `ctx.ui.notify(same, "error")`; return `1`.
 2. `plan = await planExec(req, { complete })`.
 3. `refuse`/`error` → report reason (UI: notify `"warning"`/`"error"`; headless: stderr with
@@ -429,12 +433,19 @@ export function terminalConfirm(command: string, warn?: string): Promise<boolean
 
 - `ttyAvailable()`: try `accessSync("/dev/tty", R_OK | W_OK)` → true; any error → false.
   Never throws.
-- `terminalConfirm` (the default `deps.prompt`): open `/dev/tty` read+write
-  (`node:fs` createReadStream/createWriteStream + `node:readline/promises`), ask
-  `rl.question` with the text `[warn ? `⚠ security risk — ${warn}\n` : ""] +
-  `$ ${command}\n` + `Run this command? [y/N] ``, close rl, return
-  `/^(y|yes)$/i.test(answer.trim())`. ANY failure (no tty, EOF/close before answer,
-  stream error) → `false` — never throws, never touches stdout/stderr.
+- `terminalConfirm` (the default `deps.prompt`): open `/dev/tty` with `openSync("r")`
+  + `openSync("w")` wrapped in **`node:tty` ReadStream/WriteStream** +
+  `node:readline/promises`, ask `rl.question` with the text
+  `[warn ? `⚠ security risk — ${warn}\n` : ""] + `$ ${command}\n` +
+  `Run this command? [y/N] ``, close rl, return `/^(y|yes)$/i.test(answer.trim())`.
+  ANY failure (no tty, EOF/close before answer, stream error) → `false` — never
+  throws, never touches stdout/stderr. **Why node:tty, not fs streams:** an
+  `fs.createReadStream("/dev/tty")` read blocks in libuv's threadpool where it
+  cannot be cancelled — `destroy()` left the request pending and pi stayed alive
+  after the report until one more Enter handed the terminal back (reproduced in a
+  pty, both on decline and confirm; `--exec-yes` was unaffected). uv_tty reads are
+  event-driven and destroy cleanly. Two separate fds — each stream closes exactly
+  its own, no shared-fd double-close.
 - Dry-run marker hint (print/json only): when the dry-run came from the no-terminal
   headless rule (i.e. `!req.printOnly && !req.hasUI`), stderr says
   `pi-exec: dry run — not executed (no terminal to confirm; pass --exec-yes to run,

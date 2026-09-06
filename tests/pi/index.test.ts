@@ -633,6 +633,96 @@ describe("piExec factory — --exec-model (D-12)", () => {
     expect(shutdown).toHaveBeenCalledOnce();
     expect(process.exitCode).toBe(0);
   });
+
+  it("D-14 integration: no flag + resolvable $PI_EXEC_MODEL → the env model generates", async () => {
+    const sentinelModel = { provider: "ollama", id: "glm-5.3-flash:cloud" };
+    const find = vi.fn(() => sentinelModel);
+    const registryComplete = vi.fn(async () => ({
+      role: "assistant",
+      content: [{ type: "text", text: "echo hi\n" }],
+    }));
+    const previousEnv = process.env.PI_EXEC_MODEL;
+    process.env.PI_EXEC_MODEL = "ollama/glm-5.3-flash:cloud";
+    try {
+      const { pi, sessionStartHandler, flagValues } = makePi();
+      const deps = {
+        exec: vi.fn(async () => ({ code: 0, killed: false })),
+        prompt: vi.fn(async () => true),
+        ttyAvailable: vi.fn(() => false),
+        historyPath,
+      };
+      piExec(pi, deps);
+      flagValues.set("exec", "list files");
+      const { ctx, shutdown } = makeCtx("print", undefined, { find, complete: registryComplete });
+      await sessionStartHandler()({ reason: "startup" }, ctx);
+      expect(find).toHaveBeenCalledWith("ollama", "glm-5.3-flash:cloud");
+      const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+      expect(modelArg).toBe(sentinelModel);
+      expect(shutdown).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(0);
+    } finally {
+      if (previousEnv === undefined) delete process.env.PI_EXEC_MODEL;
+      else process.env.PI_EXEC_MODEL = previousEnv;
+    }
+  });
+
+  it("D-14 integration: no flag, no env → the built-in cheap default is what generates", async () => {
+    const sentinelModel = { provider: "ollama", id: "deepseek-v4-flash:cloud" };
+    const find = vi.fn((provider: string, id: string) =>
+      provider === "ollama" && id === "deepseek-v4-flash:cloud" ? sentinelModel : undefined,
+    );
+    const registryComplete = vi.fn(async () => ({
+      role: "assistant",
+      content: [{ type: "text", text: "echo hi\n" }],
+    }));
+    const previousEnv = process.env.PI_EXEC_MODEL;
+    delete process.env.PI_EXEC_MODEL;
+    try {
+      const { pi, sessionStartHandler, flagValues } = makePi();
+      const deps = {
+        exec: vi.fn(async () => ({ code: 0, killed: false })),
+        prompt: vi.fn(async () => true),
+        ttyAvailable: vi.fn(() => false),
+        historyPath,
+      };
+      piExec(pi, deps);
+      flagValues.set("exec", "list files");
+      const { ctx, shutdown } = makeCtx("print", undefined, { find, complete: registryComplete });
+      await sessionStartHandler()({ reason: "startup" }, ctx);
+      expect(find).toHaveBeenCalledWith("ollama", "deepseek-v4-flash:cloud");
+      const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+      expect(modelArg).toBe(sentinelModel);
+      expect(shutdown).toHaveBeenCalledOnce();
+    } finally {
+      if (previousEnv === undefined) delete process.env.PI_EXEC_MODEL;
+      else process.env.PI_EXEC_MODEL = previousEnv;
+    }
+  });
+
+  it("D-14 integration: in-session /exec also uses the cheap default", async () => {
+    const sentinelModel = { provider: "ollama", id: "deepseek-v4-flash:cloud" };
+    const find = vi.fn(() => sentinelModel);
+    const registryComplete = vi.fn(async () => ({
+      role: "assistant",
+      content: [{ type: "text", text: "echo hi\n" }],
+    }));
+    const { pi, commands } = makePi();
+    const deps = {
+      exec: vi.fn(async () => ({ code: 0, killed: false })),
+      prompt: vi.fn(async () => true),
+      ttyAvailable: vi.fn(() => false),
+      historyPath,
+    };
+    piExec(pi, deps);
+    const execCommand = commands.get("exec");
+    if (!execCommand) throw new Error("/exec command was not registered");
+    const { ctx } = makeCtx("tui", undefined, { find, complete: registryComplete });
+    await execCommand.handler("list files", ctx as ExtensionCommandContext);
+    expect(find).toHaveBeenCalledWith("ollama", "deepseek-v4-flash:cloud");
+    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
+    expect(modelArg).toBe(sentinelModel);
+    expect(deps.exec).toHaveBeenCalledOnce();
+  });
 });
 
 describe("piExec factory — --exec-history one-shot", () => {

@@ -13,13 +13,11 @@
 import {
   accessSync,
   constants as fsConstants,
-  createReadStream,
-  createWriteStream,
-  type ReadStream,
-  type WriteStream,
+  openSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { ReadStream as TtyReadStream, WriteStream as TtyWriteStream } from "node:tty";
 import { createInterface, type Interface } from "node:readline/promises";
 import { contentText, type Api, type Model } from "@earendil-works/pi-ai";
 import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -67,6 +65,50 @@ const OUTPUT_BUFFER_CAP = 8000;
 /** Last-3 history commands are passed to the model as reference context. */
 const RECENT_COMMANDS_COUNT = 3;
 
+/**
+ * D-14: pi has no separate "cheap model" concept — settings.json holds a single
+ * defaultModel — so the generation default is a hardcoded flash-class model.
+ * Two escape hatches keep it from being a trap: $PI_EXEC_MODEL (machine config)
+ * and --exec-model (per-run, factory-resolved, fail-loud). Anything here that
+ * fails to resolve must degrade to the session model, never break an exec.
+ */
+export const DEFAULT_EXEC_MODEL = { provider: "ollama", id: "deepseek-v4-flash:cloud" } as const;
+
+/** Env override for the default generation model, format "provider/model-id". */
+export const EXEC_MODEL_ENV = "PI_EXEC_MODEL";
+
+/**
+ * D-14 default generation model. $PI_EXEC_MODEL ("provider/model-id") wins
+ * when set and resolvable; a set-but-unknown or malformed value warns and
+ * falls through to the built-in default. Unresolvable → undefined → runExec
+ * falls back to ctx.model. Registry hiccups (missing/throwing find) are
+ * swallowed — the resolver must never throw.
+ */
+export function resolveDefaultModel(
+  ctx: RunCtx,
+  env: NodeJS.ProcessEnv = process.env,
+): Model<Api> | undefined {
+  const find = (provider: string, id: string): Model<Api> | undefined => {
+    try {
+      return ctx.modelRegistry.find(provider, id);
+    } catch {
+      return undefined;
+    }
+  };
+  const raw = env[EXEC_MODEL_ENV];
+  if (typeof raw === "string" && raw.trim() !== "") {
+    const slash = raw.indexOf("/");
+    if (slash > 0) {
+      const found = find(raw.slice(0, slash), raw.slice(slash + 1));
+      if (found) return found;
+      notify(ctx, `${EXEC_MODEL_ENV} ${raw}: unknown model — using the built-in default`, "warning");
+    } else {
+      notify(ctx, `usage: ${EXEC_MODEL_ENV}=<provider/model-id> — ignoring the value`, "warning");
+    }
+  }
+  return find(DEFAULT_EXEC_MODEL.provider, DEFAULT_EXEC_MODEL.id);
+}
+
 type RunCtx = ExtensionContext | ExtensionCommandContext;
 
 /**
@@ -103,17 +145,24 @@ export function ttyAvailable(): boolean {
 
 /**
  * D-9 default prompt: ask `Run this command? [y/N]` directly on /dev/tty —
- * never stdout/stderr. ANY failure (no tty — including an async open error
- * like ENXIO, EOF before an answer, stream error) resolves false; never
- * throws, never crashes on unhandled 'error' events.
+ * never stdout/stderr. ANY failure (no tty — openSync throws e.g. ENXIO
+ * without a controlling terminal, EOF before an answer, stream error)
+ * resolves false; never throws, never crashes on unhandled 'error' events.
+ *
+ * The streams are node:tty streams, NOT fs.createReadStream("/dev/tty"):
+ * an fs stream's read(2) blocks in libuv's threadpool and cannot be
+ * cancelled — destroy() left the request pending and pi stayed alive after
+ * the report until the next Enter handed the terminal back. uv_tty reads
+ * are event-driven and destroy cleanly. Two fds so each stream closes
+ * exactly its own — no shared-fd double-close.
  */
 export async function terminalConfirm(command: string, warn?: string): Promise<boolean> {
   let rl: Interface | undefined;
-  let input: ReadStream | undefined;
-  let output: WriteStream | undefined;
+  let input: TtyReadStream | undefined;
+  let output: TtyWriteStream | undefined;
   try {
-    input = createReadStream("/dev/tty");
-    output = createWriteStream("/dev/tty");
+    input = new TtyReadStream(openSync("/dev/tty", "r"));
+    output = new TtyWriteStream(openSync("/dev/tty", "w"));
     rl = createInterface({ input, output });
     // Opening /dev/tty can fail asynchronously (ENXIO without a controlling
     // terminal) — an unhandled EventEmitter 'error' would crash the process.
@@ -162,6 +211,8 @@ export const EXEC_HELP_LINES: readonly string[] = [
   '  pi --exec ""                             an empty value also prints this menu',
   "  /exec <request>                          same as --exec inside a running session",
   "  /exec-history [n]                        recent history inside a running session",
+  "",
+  "Model: $PI_EXEC_MODEL, else ollama/deepseek-v4-flash:cloud — the session model is only the fallback.",
   "",
   "Safety: deny-class commands never run, even with --exec-yes; warn-class risks show",
   "their reason before you confirm; every command asks first by default, and headless",
@@ -217,9 +268,11 @@ export async function runExec(
     .filter((command) => command !== "")
     .slice(-RECENT_COMMANDS_COUNT);
 
-  // Step 1: generation model — the --exec-model override (D-12) wins over the
-  // session model; when both are absent there is nothing to generate from.
-  const model = deps.model ?? ctx.model;
+  // Step 1: generation model — the --exec-model override (D-12) wins; then
+  // the cheap default (D-14: $PI_EXEC_MODEL or the built-in flash model); the
+  // session model is only the final fallback. Unresolvable everywhere → the
+  // "no active model" error below.
+  const model = deps.model ?? resolveDefaultModel(ctx) ?? ctx.model;
   if (!model) {
     notify(ctx, "no active model — set one with /model or a provider env", "error");
     await record("error", "");
