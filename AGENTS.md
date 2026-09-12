@@ -1,8 +1,7 @@
 # AGENTS.md — working on pi-exec
 
-Guidance for any agent (or human) making changes here. `docs/plan.md` is the source of
-truth for *why* (design); `docs/implementation-brief.md` records the verified pi API
-facts and the binding per-file specs. This file is about *how we work here*.
+Guidance for any agent (or human) making changes here. `docs/plan.md` is the concise
+design source of truth. This file is about how we work here.
 
 ## What this project is
 
@@ -31,7 +30,7 @@ src/core/      Portable engine: contract, parse, lint, plan (planExec), history 
 src/pi/        pi adapter: factory (flags, session_start), run (reporting/confirm), exec (spawn)
 tests/core/    pure unit suites (parse, lint, plan, history, purity)
 tests/pi/      adapter suites (run, index, exec) — fakes only
-docs/          plan.md (design) + implementation-brief.md (verified API facts, binding specs)
+docs/          plan.md (design)
 scripts/       pi-exec.sh — the verified v0 standalone wrapper
 ```
 

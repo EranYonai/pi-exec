@@ -89,9 +89,8 @@ function makePi(): FakePi {
 function makeCtx(
   mode: ExtensionContext["mode"],
   signal?: AbortSignal,
-  /** D-12 tests: override the fake modelRegistry (find/complete spies). */
+  /** Override the fake modelRegistry completion. */
   registry?: {
-    find?: (provider: string, id: string) => unknown;
     complete?: (model: unknown, context: unknown, options: unknown) => Promise<unknown>;
   },
 ) {
@@ -108,7 +107,6 @@ function makeCtx(
         throw new Error("registry must not be used when deps.complete is injected");
       }),
   };
-  if (registry?.find) modelRegistry.find = registry.find;
   const raw = {
     ui,
     mode,
@@ -213,7 +211,7 @@ async function captureStdout(body: () => Promise<void>): Promise<string[]> {
 }
 
 describe("piExec factory — registration", () => {
-  it("registers the 7 flags with the verified types", () => {
+  it("registers the 6 flags with the verified types", () => {
     const { pi, flags, registerFlag } = makePi();
     piExec(pi);
     const names = (registerFlag.mock.calls as [string, FlagOptions][]).map(([name]) => name);
@@ -224,7 +222,6 @@ describe("piExec factory — registration", () => {
       "exec-timeout",
       "exec-history",
       "exec-help",
-      "exec-model",
     ]);
     expect(flags.get("exec")?.type).toBe("string");
     expect(flags.get("exec-yes")).toMatchObject({ type: "boolean", default: false });
@@ -238,12 +235,6 @@ describe("piExec factory — registration", () => {
     expect(help?.type).toBe("boolean");
     // No default: help must not fire in every plain pi session.
     expect(help).not.toHaveProperty("default");
-    // D-12: no default — an override must be explicit.
-    expect(flags.get("exec-model")).toMatchObject({
-      type: "string",
-      description: "Model override for generation (provider/model-id)",
-    });
-    expect(flags.get("exec-model")).not.toHaveProperty("default");
   });
 
   it("registers /exec and /exec-history commands", () => {
@@ -553,17 +544,13 @@ describe("piExec factory — canPrompt wiring (D-9)", () => {
   });
 });
 
-describe("piExec factory — --exec-model (D-12)", () => {
-  it("valid provider/model-id → registry find called; the found model reaches runExec (captured by the fake registry)", async () => {
-    const sentinelModel = { provider: "ollama", id: "glm-5.3-flash:cloud" };
-    const find = vi.fn(() => sentinelModel);
+describe("piExec factory — active model", () => {
+  it("uses pi's active model", async () => {
     const registryComplete = vi.fn(async () => ({
       role: "assistant",
       content: [{ type: "text", text: "echo hi\n" }],
     }));
     const { pi, sessionStartHandler, flagValues } = makePi();
-    // No deps.complete: runExec must use the default registry seam, making
-    // the resolved model observable in the captured complete call.
     const deps = {
       exec: vi.fn(async () => ({ code: 0, killed: false })),
       prompt: vi.fn(async () => true),
@@ -572,159 +559,14 @@ describe("piExec factory — --exec-model (D-12)", () => {
     };
     piExec(pi, deps);
     flagValues.set("exec", "list files");
-    flagValues.set("exec-model", "ollama/glm-5.3-flash:cloud");
-    const { ctx, shutdown } = makeCtx("print", undefined, { find, complete: registryComplete });
+    const { ctx, shutdown } = makeCtx("print", undefined, { complete: registryComplete });
     await sessionStartHandler()({ reason: "startup" }, ctx);
-    expect(find).toHaveBeenCalledWith("ollama", "glm-5.3-flash:cloud");
-    expect(registryComplete).toHaveBeenCalledOnce();
     const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
-    expect(modelArg).toBe(sentinelModel);
-    // Headless without a terminal → dry-run; the pipeline itself still ran.
-    expect(deps.exec).not.toHaveBeenCalled();
+    expect(modelArg).toEqual({ provider: "test", id: "test-model" });
     expect(shutdown).toHaveBeenCalledOnce();
     expect(process.exitCode).toBe(0);
-  });
-
-  it("unknown model id → usage failure exit 1 mentioning pi --list-models, shutdown", async () => {
-    const stderr = await captureStderr(async () => {
-      const { pi, sessionStartHandler, flagValues } = makePi();
-      const deps = makeDeps();
-      piExec(pi, deps);
-      flagValues.set("exec", "list files");
-      flagValues.set("exec-model", "ollama/nope");
-      const { ctx, shutdown } = makeCtx("print", undefined, { find: vi.fn(() => undefined) });
-      await sessionStartHandler()({ reason: "startup" }, ctx);
-      expect(shutdown).toHaveBeenCalledOnce();
-      expect(process.exitCode).toBe(1);
-      expect(deps.complete).not.toHaveBeenCalled();
-      expect(deps.exec).not.toHaveBeenCalled();
-    });
-    expect(stderr.join("")).toContain("--list-models");
-    expect(stderr.join("")).toContain("ollama/nope");
-  });
-
-  it("value without / → usage failure exit 1 mentioning the provider/model-id format", async () => {
-    const stderr = await captureStderr(async () => {
-      const { pi, sessionStartHandler, flagValues } = makePi();
-      const deps = makeDeps();
-      const find = vi.fn(() => undefined);
-      piExec(pi, deps);
-      flagValues.set("exec", "list files");
-      flagValues.set("exec-model", "just-an-id");
-      const { ctx, shutdown } = makeCtx("print", undefined, { find });
-      await sessionStartHandler()({ reason: "startup" }, ctx);
-      expect(shutdown).toHaveBeenCalledOnce();
-      expect(process.exitCode).toBe(1);
-      expect(deps.complete).not.toHaveBeenCalled();
-      expect(find).not.toHaveBeenCalled();
-    });
-    expect(stderr.join("")).toContain("provider/model-id");
-  });
-
-  it("empty value → treated as no override: the pipeline runs with the injected deps", async () => {
-    const { pi, sessionStartHandler, flagValues } = makePi();
-    const deps = makeDeps();
-    piExec(pi, deps);
-    flagValues.set("exec", "list files");
-    flagValues.set("exec-model", "");
-    const { ctx, shutdown } = makeCtx("print");
-    await sessionStartHandler()({ reason: "startup" }, ctx);
-    expect(deps.complete).toHaveBeenCalledOnce();
-    expect(shutdown).toHaveBeenCalledOnce();
-    expect(process.exitCode).toBe(0);
-  });
-
-  it("D-14 integration: no flag + resolvable $PI_EXEC_MODEL → the env model generates", async () => {
-    const sentinelModel = { provider: "ollama", id: "glm-5.3-flash:cloud" };
-    const find = vi.fn(() => sentinelModel);
-    const registryComplete = vi.fn(async () => ({
-      role: "assistant",
-      content: [{ type: "text", text: "echo hi\n" }],
-    }));
-    const previousEnv = process.env.PI_EXEC_MODEL;
-    process.env.PI_EXEC_MODEL = "ollama/glm-5.3-flash:cloud";
-    try {
-      const { pi, sessionStartHandler, flagValues } = makePi();
-      const deps = {
-        exec: vi.fn(async () => ({ code: 0, killed: false })),
-        prompt: vi.fn(async () => true),
-        ttyAvailable: vi.fn(() => false),
-        historyPath,
-      };
-      piExec(pi, deps);
-      flagValues.set("exec", "list files");
-      const { ctx, shutdown } = makeCtx("print", undefined, { find, complete: registryComplete });
-      await sessionStartHandler()({ reason: "startup" }, ctx);
-      expect(find).toHaveBeenCalledWith("ollama", "glm-5.3-flash:cloud");
-      const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
-      expect(modelArg).toBe(sentinelModel);
-      expect(shutdown).toHaveBeenCalledOnce();
-      expect(process.exitCode).toBe(0);
-    } finally {
-      if (previousEnv === undefined) delete process.env.PI_EXEC_MODEL;
-      else process.env.PI_EXEC_MODEL = previousEnv;
-    }
-  });
-
-  it("D-14 integration: no flag, no env → the built-in cheap default is what generates", async () => {
-    const sentinelModel = { provider: "ollama", id: "deepseek-v4-flash:cloud" };
-    const find = vi.fn((provider: string, id: string) =>
-      provider === "ollama" && id === "deepseek-v4-flash:cloud" ? sentinelModel : undefined,
-    );
-    const registryComplete = vi.fn(async () => ({
-      role: "assistant",
-      content: [{ type: "text", text: "echo hi\n" }],
-    }));
-    const previousEnv = process.env.PI_EXEC_MODEL;
-    delete process.env.PI_EXEC_MODEL;
-    try {
-      const { pi, sessionStartHandler, flagValues } = makePi();
-      const deps = {
-        exec: vi.fn(async () => ({ code: 0, killed: false })),
-        prompt: vi.fn(async () => true),
-        ttyAvailable: vi.fn(() => false),
-        historyPath,
-      };
-      piExec(pi, deps);
-      flagValues.set("exec", "list files");
-      const { ctx, shutdown } = makeCtx("print", undefined, { find, complete: registryComplete });
-      await sessionStartHandler()({ reason: "startup" }, ctx);
-      expect(find).toHaveBeenCalledWith("ollama", "deepseek-v4-flash:cloud");
-      const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
-      expect(modelArg).toBe(sentinelModel);
-      expect(shutdown).toHaveBeenCalledOnce();
-    } finally {
-      if (previousEnv === undefined) delete process.env.PI_EXEC_MODEL;
-      else process.env.PI_EXEC_MODEL = previousEnv;
-    }
-  });
-
-  it("D-14 integration: in-session /exec also uses the cheap default", async () => {
-    const sentinelModel = { provider: "ollama", id: "deepseek-v4-flash:cloud" };
-    const find = vi.fn(() => sentinelModel);
-    const registryComplete = vi.fn(async () => ({
-      role: "assistant",
-      content: [{ type: "text", text: "echo hi\n" }],
-    }));
-    const { pi, commands } = makePi();
-    const deps = {
-      exec: vi.fn(async () => ({ code: 0, killed: false })),
-      prompt: vi.fn(async () => true),
-      ttyAvailable: vi.fn(() => false),
-      historyPath,
-    };
-    piExec(pi, deps);
-    const execCommand = commands.get("exec");
-    if (!execCommand) throw new Error("/exec command was not registered");
-    const { ctx } = makeCtx("tui", undefined, { find, complete: registryComplete });
-    await execCommand.handler("list files", ctx as ExtensionCommandContext);
-    expect(find).toHaveBeenCalledWith("ollama", "deepseek-v4-flash:cloud");
-    const [modelArg] = registryComplete.mock.calls[0] as unknown as [unknown];
-    expect(modelArg).toBe(sentinelModel);
-    expect(deps.exec).toHaveBeenCalledOnce();
   });
 });
-
 describe("piExec factory — --exec-history one-shot", () => {
   it("preview printed to stdout (print mode), exit 0, exec pipeline NOT invoked", async () => {
     await appendHistoryEntry(historyPath, makeHistoryEntry({ command: "echo one" }));

@@ -1,7 +1,6 @@
 /**
- * pi adapter for the exec pipeline: resolves the generation model — the
- * `--exec-model` override (`deps.model`, D-12) or the session's configured
- * model through `ctx.modelRegistry` (auth is pi's) — executes the plan through
+ * pi adapter for the exec pipeline: uses the session's configured model
+ * through `ctx.modelRegistry` (auth is pi's), executes the plan through
  * the exec seam, and reports by mode — print stdout stays pipeable, json
  * keeps stdout clean for pi's JSON channel, TUI gets live widgets.
  *
@@ -19,7 +18,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { ReadStream as TtyReadStream, WriteStream as TtyWriteStream } from "node:tty";
 import { createInterface, type Interface } from "node:readline/promises";
-import { contentText, type Api, type Model } from "@earendil-works/pi-ai";
+import { contentText } from "@earendil-works/pi-ai";
 import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   appendHistoryEntry,
@@ -40,8 +39,6 @@ export interface RunDeps {
   complete?: CompleteFn;
   exec?: ExecFn;
   historyPath?: string;
-  /** D-12: overrides the session model for generation (resolved from --exec-model by the factory). */
-  model?: Model<Api>;
   prompt?: PromptFn;
   ttyAvailable?: () => boolean;
 }
@@ -64,50 +61,6 @@ const OUTPUT_BUFFER_CAP = 8000;
 
 /** Last-3 history commands are passed to the model as reference context. */
 const RECENT_COMMANDS_COUNT = 3;
-
-/**
- * D-14: pi has no separate "cheap model" concept — settings.json holds a single
- * defaultModel — so the generation default is a hardcoded flash-class model.
- * Two escape hatches keep it from being a trap: $PI_EXEC_MODEL (machine config)
- * and --exec-model (per-run, factory-resolved, fail-loud). Anything here that
- * fails to resolve must degrade to the session model, never break an exec.
- */
-export const DEFAULT_EXEC_MODEL = { provider: "ollama", id: "deepseek-v4-flash:cloud" } as const;
-
-/** Env override for the default generation model, format "provider/model-id". */
-export const EXEC_MODEL_ENV = "PI_EXEC_MODEL";
-
-/**
- * D-14 default generation model. $PI_EXEC_MODEL ("provider/model-id") wins
- * when set and resolvable; a set-but-unknown or malformed value warns and
- * falls through to the built-in default. Unresolvable → undefined → runExec
- * falls back to ctx.model. Registry hiccups (missing/throwing find) are
- * swallowed — the resolver must never throw.
- */
-export function resolveDefaultModel(
-  ctx: RunCtx,
-  env: NodeJS.ProcessEnv = process.env,
-): Model<Api> | undefined {
-  const find = (provider: string, id: string): Model<Api> | undefined => {
-    try {
-      return ctx.modelRegistry.find(provider, id);
-    } catch {
-      return undefined;
-    }
-  };
-  const raw = env[EXEC_MODEL_ENV];
-  if (typeof raw === "string" && raw.trim() !== "") {
-    const slash = raw.indexOf("/");
-    if (slash > 0) {
-      const found = find(raw.slice(0, slash), raw.slice(slash + 1));
-      if (found) return found;
-      notify(ctx, `${EXEC_MODEL_ENV} ${raw}: unknown model — using the built-in default`, "warning");
-    } else {
-      notify(ctx, `usage: ${EXEC_MODEL_ENV}=<provider/model-id> — ignoring the value`, "warning");
-    }
-  }
-  return find(DEFAULT_EXEC_MODEL.provider, DEFAULT_EXEC_MODEL.id);
-}
 
 type RunCtx = ExtensionContext | ExtensionCommandContext;
 
@@ -205,14 +158,13 @@ export const EXEC_HELP_LINES: readonly string[] = [
   '  pi --exec "<request>" --exec-yes         skip the confirmation (safety lint still applies)',
   '  pi --exec "<request>" --exec-print       print the command only, never run it',
   '  pi --exec "<request>" --exec-timeout 30  execution timeout in seconds (default 120)',
-  '  pi --exec "<request>" --exec-model p/m   generate with another model (provider/model-id)',
   "  pi --exec-history <n>                    print the last n history entries and exit",
   "  pi --exec-help                           print this help menu and exit",
   '  pi --exec ""                             an empty value also prints this menu',
   "  /exec <request>                          same as --exec inside a running session",
   "  /exec-history [n]                        recent history inside a running session",
   "",
-  "Model: $PI_EXEC_MODEL, else ollama/deepseek-v4-flash:cloud — the session model is only the fallback.",
+  "Model: pi's active model (use pi's --model flag for a one-off override).",
   "",
   "Safety: deny-class commands never run, even with --exec-yes; warn-class risks show",
   "their reason before you confirm; every command asks first by default, and headless",
@@ -268,11 +220,7 @@ export async function runExec(
     .filter((command) => command !== "")
     .slice(-RECENT_COMMANDS_COUNT);
 
-  // Step 1: generation model — the --exec-model override (D-12) wins; then
-  // the cheap default (D-14: $PI_EXEC_MODEL or the built-in flash model); the
-  // session model is only the final fallback. Unresolvable everywhere → the
-  // "no active model" error below.
-  const model = deps.model ?? resolveDefaultModel(ctx) ?? ctx.model;
+  const model = ctx.model;
   if (!model) {
     notify(ctx, "no active model — set one with /model or a provider env", "error");
     await record("error", "");

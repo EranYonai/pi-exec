@@ -2,9 +2,7 @@ import type { LintRule, LintVerdict } from "./types";
 
 /**
  * Hard-deny rules: the command is never run, not even with --exec-yes.
- * First matching rule wins. Patterns are pre-verified against the 54-case
- * table in docs/implementation-brief.md §4.4.1 — use verbatim, do not
- * improvise alternations.
+ * First matching rule wins. Keep each rule's positive and negative tests.
  */
 export const DENY_RULES: readonly LintRule[] = [
   {

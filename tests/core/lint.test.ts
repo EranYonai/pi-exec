@@ -5,8 +5,7 @@ import type { LintVerdict } from "../../src/core/types";
 const verdictOf = (command: string): LintVerdict["verdict"] => lintCommand(command).verdict;
 
 /**
- * The verified 54-case table from docs/implementation-brief.md §4.4.1 —
- * the rule table must satisfy every entry.
+ * The rule table must satisfy every positive and negative case.
  */
 const CASES: ReadonlyArray<readonly [command: string, expected: LintVerdict["verdict"]]> = [
   ["rm -rf /", "deny"],
