@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+dist/
+*.log
+.DS_Store
+
+# local pi harness config (see AGENTS.md smoke instructions)
+.pi/
