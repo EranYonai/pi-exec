@@ -1,6 +1,6 @@
 {
   "name": "pi-exec",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Natural language → one shell command → confirm → run. A lightweight pi extension: pi --exec \"explanation of command\".",
   "type": "module",
   "sideEffects": false,

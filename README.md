@@ -2,6 +2,13 @@
 
 Natural language in, one shell command out—confirmed, executed, reported.
 
+<p align="center">
+  <a href="https://www.npmjs.com/package/pi-exec"><img alt="npm version" src="https://img.shields.io/npm/v/pi-exec?color=blue&logo=npm"></a>
+  <a href="https://github.com/EranYonai/pi-exec/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/EranYonai/pi-exec/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/EranYonai/pi-exec/releases"><img alt="release" src="https://img.shields.io/github/v/release/EranYonai/pi-exec?color=blue&logo=github"></a>
+  <a href="./LICENSE"><img alt="license: MIT" src="https://img.shields.io/npm/l/pi-exec?color=green"></a>
+</p>
+
 ```bash
 pi --exec "find all PDF files larger than 50 MB under my home directory"
 ```

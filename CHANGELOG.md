@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.2] — 2026-09-12
+
+- Added npm, CI, release, and license badges to the README.
+
 ## [0.1.0] — unreleased
 
 - Added the portable one-command generation, parsing, safety-lint, and history core.
