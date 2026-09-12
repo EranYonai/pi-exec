@@ -14,7 +14,7 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run check
@@ -27,8 +27,8 @@ jobs:
           }
       - name: Verify package artifact
         run: npm pack --dry-run
-      - name: Publish to npm
-        run: npm publish --provenance --access public
+      - name: Stage package on npm
+        run: npm stage publish
       - name: Create GitHub Release
         run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
         env:

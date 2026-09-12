@@ -122,11 +122,11 @@ The version in `package.json` is the source of truth and is committed together w
 `package-lock.json`. Make that version bump in a PR, never directly on `main`:
 
 ```bash
-git switch -c fix/release-v0.1.1
+git switch -c fix/release-v0.1.3
 npm version patch --no-git-tag-version # or minor / major
 # update CHANGELOG.md for the new version
 git add package.json package-lock.json CHANGELOG.md
-git commit -m "release: v0.1.1"
+git commit -m "release: v0.1.3"
 git push -u origin HEAD
 ```
 
@@ -135,14 +135,15 @@ After that PR merges, tag the resulting `main` commit and push only that tag:
 ```bash
 git switch main
 git pull --ff-only
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 Pushing a `vX.Y.Z` tag starts the GitHub Actions release workflow. It verifies the tag
-matches `package.json`, runs the checks, publishes the npm artifact with provenance, and
-creates the matching GitHub Release. Ordinary pushes to `main` do not publish. Before the
-first release, configure npm trusted publishing for this repository; it uses the workflow's
+matches `package.json`, runs the checks, stages the npm artifact with provenance, and
+creates the matching GitHub Release. Staged packages are not public until a maintainer
+approves them in npm's **Staged Packages** view (with 2FA). Ordinary pushes to `main` do
+not publish. Configure npm trusted publishing for this repository; it uses the workflow's
 OIDC permission and needs no long-lived publish token.
 
 See [docs/plan.md](docs/plan.md) for the concise design.
