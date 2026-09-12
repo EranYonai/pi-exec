@@ -89,6 +89,16 @@ Outcomes are appended to `~/.pi/agent/cache/pi-exec/history.jsonl`. Failures to 
 write history never break execution. Child output is streamed, not stored. Delete the file
 to reset it.
 
+## Package artifact
+
+The npm package contains the extension sources, the `scripts/pi-exec.sh` launcher,
+this README, and the license. It does not contain tests, coverage output, or development
+configuration. Inspect the exact upload before publishing:
+
+```bash
+npm pack --dry-run
+```
+
 ## Development
 
 ```bash
@@ -98,6 +108,35 @@ npm run check
 
 `npm run check` runs strict TypeScript and enforces at least 95% coverage for lines,
 branches, functions, and statements. Tests use fakes: no network or real shell.
+
+## Releasing and versioning
+
+The version in `package.json` is the source of truth and is committed together with
+`package-lock.json`. Make that version bump in a PR, never directly on `main`:
+
+```bash
+git switch -c fix/release-v0.1.1
+npm version patch --no-git-tag-version # or minor / major
+# update CHANGELOG.md for the new version
+git add package.json package-lock.json CHANGELOG.md
+git commit -m "release: v0.1.1"
+git push -u origin HEAD
+```
+
+After that PR merges, tag the resulting `main` commit and push only that tag:
+
+```bash
+git switch main
+git pull --ff-only
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+Pushing a `vX.Y.Z` tag starts the GitHub Actions release workflow. It verifies the tag
+matches `package.json`, runs the checks, publishes the npm artifact with provenance, and
+creates the matching GitHub Release. Ordinary pushes to `main` do not publish. Before the
+first release, configure npm trusted publishing for this repository; it uses the workflow's
+OIDC permission and needs no long-lived publish token.
 
 See [docs/plan.md](docs/plan.md) for the concise design.
 

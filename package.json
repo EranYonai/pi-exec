@@ -13,7 +13,7 @@
   "bugs": "https://github.com/EranYonai/pi-exec/issues",
   "engines": { "node": ">=20.13.0" },
   "exports": { "./core": "./src/core/index.ts" },
-  "files": ["src", "README.md", "LICENSE"],
+  "files": ["src", "scripts", "README.md", "LICENSE"],
   "pi": {
     "extensions": ["./src/pi/index.ts"]
   },
